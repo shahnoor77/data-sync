@@ -1,0 +1,72 @@
+application:
+  instance_id: "${INSTANCE_ID}"
+  log_level: "${LOG_LEVEL}"
+  batch_size: 100
+  retry_attempts: 3
+  retry_delay_seconds: 5
+
+debezium:
+  connector_class: "io.debezium.connector.postgresql.PostgresConnector"
+  database_hostname: "${SOURCE_DB_HOST}"
+  database_port: "${SOURCE_DB_PORT}"
+  database_user: "${SOURCE_DB_USER}"
+  database_password: "${SOURCE_DB_PASSWORD}"
+  database_dbname: "${SOURCE_DB_NAME}"
+  database_server_name: "sensor_source_server"
+  plugin_name: "pgoutput"
+  slot_name: "sensor_cdc_slot"
+  publication_name: "sensor_publication"
+  
+  offset_storage: "org.apache.kafka.connect.storage.FileOffsetBackingStore"
+  offset_storage_file_filename: "/app/data/offsets/offset.dat"
+  offset_flush_interval_ms: 10000
+  
+  schema_history_internal: "io.debezium.storage.file.history.FileSchemaHistory"
+  schema_history_internal_file_filename: "/app/data/history/schema_history.dat"
+  
+  snapshot_mode: "initial"
+  decimal_handling_mode: "string"
+  time_precision_mode: "adaptive"
+  
+  table_include_list: "public.sensor_readings,public.temperature_sensors,public.pressure_sensors"
+
+mqtt:
+  broker_host: "${MQTT_BROKER_HOST}"
+  broker_port: "${MQTT_BROKER_PORT}"
+  username: "${MQTT_USERNAME}"
+  password: "${MQTT_PASSWORD}"
+  topic_prefix: "${MQTT_TOPIC_PREFIX}"
+  ack_topic: "sensors/ack"
+  qos: 2
+  keepalive: 60
+  reconnect_delay_seconds: 5
+
+source_database:
+  type: "${SOURCE_DB_TYPE}"
+  host: "${SOURCE_DB_HOST}"
+  port: "${SOURCE_DB_PORT}"
+  database: "${SOURCE_DB_NAME}"
+  user: "${SOURCE_DB_USER}"
+  password: "${SOURCE_DB_PASSWORD}"
+
+target_database:
+  type: "${TARGET_DB_TYPE}"
+  host: "${TARGET_DB_HOST}"
+  port: "${TARGET_DB_PORT}"
+  database: "${TARGET_DB_NAME}"
+  user: "${TARGET_DB_USER}"
+  password: "${TARGET_DB_PASSWORD}"
+
+security:
+  encryption_key: "${ENCRYPTION_KEY}"
+  signing_key: "${SIGNING_KEY}"
+  enable_encryption: true
+  sensitive_fields:
+    - "device_id"
+    - "location"
+    - "metadata"
+
+monitoring:
+  enable_metrics: true
+  metrics_port: 9090
+  health_check_interval: 30

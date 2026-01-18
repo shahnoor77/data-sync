@@ -1,0 +1,102 @@
+version: '3.8'
+
+services:
+  # PostgreSQL - Source
+  postgres-source:
+    image: postgres:15-alpine
+    container_name: postgres_source
+    env_file: .env
+    environment:
+      - POSTGRES_DB=${SOURCE_DB_NAME}
+      - POSTGRES_USER=${SOURCE_DB_USER}
+      - POSTGRES_PASSWORD=${SOURCE_DB_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_source_data:/var/lib/postgresql/data
+      - ./scripts/init_postgres_source.sql:/docker-entrypoint-initdb.d/init.sql
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=4", "-c", "max_wal_senders=4"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sensor_network
+
+  # MongoDB - Target
+  mongodb-target:
+    image: mongo:7.0
+    container_name: mongodb_target
+    env_file: .env
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${TARGET_DB_USER}
+      - MONGO_INITDB_ROOT_PASSWORD=${TARGET_DB_PASSWORD}
+      - MONGO_INITDB_DATABASE=${TARGET_DB_NAME}
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_target_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sensor_network
+
+  # Mosquitto Broker
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: mqtt_broker
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./config/mosquitto.config:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 5 mosquitto_sub -t '$$SYS/#' -C 1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sensor_network
+
+  # CDC Publisher
+  cdc-publisher:
+    build: .
+    container_name: cdc_publisher
+    env_file: .env
+    environment:
+      - SERVICE_MODE=publisher
+      - INSTANCE_ID=publisher_001
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    networks:
+      - sensor_network
+
+  # MQTT Subscriber
+  mqtt-subscriber:
+    build: .
+    container_name: mqtt_subscriber
+    env_file: .env
+    environment:
+      - SERVICE_MODE=subscriber
+      - INSTANCE_ID=subscriber_001
+    depends_on:
+      mongodb-target:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    networks:
+      - sensor_network
+
+networks:
+  sensor_network:
+    driver: bridge
+
+volumes:
+  postgres_source_data:
+  mongodb_target_data:
