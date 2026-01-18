@@ -9,14 +9,14 @@ echo "Service Mode: ${SERVICE_MODE:-publisher}"
 # Wait for dependencies
 if [ "$SERVICE_MODE" = "publisher" ]; then
     echo "Waiting for source database..."
-    until python -c "import psycopg2; psycopg2.connect('host=${SOURCE_DB_HOST} port=${SOURCE_DB_PORT} dbname=${SOURCE_DB_NAME} user=${SOURCE_DB_USER} password=${SOURCE_DB_PASSWORD}')" 2>/dev/null; do
+    until pg_isready -h "${SOURCE_DB_HOST}" -p "${SOURCE_DB_PORT}" -U "${SOURCE_DB_USER}" 2>/dev/null; do
         echo "Source database not ready, waiting..."
         sleep 2
     done
     echo "✓ Source database ready"
     
     echo "Waiting for MQTT broker..."
-    until python -c "import socket; s=socket.socket(); s.connect(('${MQTT_BROKER_HOST}', ${MQTT_BROKER_PORT}))" 2>/dev/null; do
+    until python -c "import socket; s=socket.socket(); s.connect(('${MQTT_BROKER_HOST}', ${MQTT_BROKER_PORT})); s.close()" 2>/dev/null; do
         echo "MQTT broker not ready, waiting..."
         sleep 2
     done
@@ -31,7 +31,7 @@ if [ "$SERVICE_MODE" = "subscriber" ]; then
             sleep 2
         done
     elif [ "$TARGET_DB_TYPE" = "postgresql" ]; then
-        until python -c "import psycopg2; psycopg2.connect('host=${TARGET_DB_HOST} port=${TARGET_DB_PORT} dbname=${TARGET_DB_NAME} user=${TARGET_DB_USER} password=${TARGET_DB_PASSWORD}')" 2>/dev/null; do
+        until pg_isready -h "${TARGET_DB_HOST}" -p "${TARGET_DB_PORT}" -U "${TARGET_DB_USER}" 2>/dev/null; do
             echo "Target database not ready, waiting..."
             sleep 2
         done
@@ -39,7 +39,7 @@ if [ "$SERVICE_MODE" = "subscriber" ]; then
     echo "✓ Target database ready"
     
     echo "Waiting for MQTT broker..."
-    until python -c "import socket; s=socket.socket(); s.connect(('${MQTT_BROKER_HOST}', ${MQTT_BROKER_PORT}))" 2>/dev/null; do
+    until python -c "import socket; s=socket.socket(); s.connect(('${MQTT_BROKER_HOST}', ${MQTT_BROKER_PORT})); s.close()" 2>/dev/null; do
         echo "MQTT broker not ready, waiting..."
         sleep 2
     done

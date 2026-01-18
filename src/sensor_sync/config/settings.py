@@ -6,7 +6,7 @@ Loads from YAML files and environment variables
 import os
 import yaml
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from dotenv import load_dotenv
 
 
@@ -17,23 +17,13 @@ class Settings:
     """
     
     def __init__(self, config_file: str = "config/config.yaml"):
-        """
-        Initialize settings
-        
-        Args:
-            config_file: Path to YAML configuration file
-        """
-        # Load environment variables
+        """Initialize settings"""
         load_dotenv()
         
-        # Load YAML configuration
         self.config_file = Path(config_file)
         self.config = self._load_config()
-        
-        # Resolve environment variables in config
         self.config = self._resolve_env_vars(self.config)
         
-        # Validate configuration
         self._validate_config()
     
     def _load_config(self) -> Dict[str, Any]:
@@ -61,7 +51,6 @@ class Settings:
         elif isinstance(config, list):
             return [self._resolve_env_vars(item) for item in config]
         elif isinstance(config, str):
-            # Check if string contains environment variable
             if config.startswith('${') and config.endswith('}'):
                 env_var = config[2:-1]
                 value = os.getenv(env_var)
@@ -78,7 +67,7 @@ class Settings:
         """Validate required configuration fields"""
         required_sections = [
             'application',
-            'debezium',
+            'change_detection',
             'mqtt',
             'source_database',
             'target_database',
@@ -130,62 +119,6 @@ class Settings:
         
         return value
     
-    def get_debezium_properties(self) -> Dict[str, str]:
-        """
-        Get Debezium connector properties
-        Returns properties formatted for Java configuration
-        """
-        debezium_config = self.config['debezium']
-        source_db = self.config['source_database']
-        
-        # Base properties
-        properties = {
-            'connector.class': debezium_config['connector_class'],
-            'offset.storage': debezium_config['offset_storage'],
-            'offset.storage.file.filename': debezium_config['offset_storage_file_filename'],
-            'offset.flush.interval.ms': str(debezium_config['offset_flush_interval_ms']),
-            'database.hostname': debezium_config['database_hostname'],
-            'database.port': str(debezium_config['database_port']),
-            'database.user': debezium_config['database_user'],
-            'database.password': debezium_config['database_password'],
-            'database.dbname': debezium_config['database_dbname'],
-            'database.server.name': debezium_config['database_server_name'],
-            'snapshot.mode': debezium_config['snapshot_mode'],
-        }
-        
-        # PostgreSQL specific properties
-        if source_db['type'] == 'postgresql':
-            properties.update({
-                'plugin.name': debezium_config.get('plugin_name', 'pgoutput'),
-                'slot.name': debezium_config.get('slot_name', 'debezium'),
-                'publication.name': debezium_config.get('publication_name', 'dbz_publication'),
-                'schema.history.internal': debezium_config['schema_history_internal'],
-                'schema.history.internal.file.filename': debezium_config['schema_history_internal_file_filename'],
-            })
-        
-        # MySQL specific properties
-        elif source_db['type'] == 'mysql':
-            properties.update({
-                'database.server.id': '1',
-                'database.include.list': debezium_config['database_dbname'],
-                'schema.history.internal': debezium_config['schema_history_internal'],
-                'schema.history.internal.file.filename': debezium_config['schema_history_internal_file_filename'],
-            })
-        
-        # Add table include list if specified
-        if 'table_include_list' in debezium_config:
-            properties['table.include.list'] = debezium_config['table_include_list']
-        
-        # Add decimal handling
-        if 'decimal_handling_mode' in debezium_config:
-            properties['decimal.handling.mode'] = debezium_config['decimal_handling_mode']
-        
-        # Add time precision
-        if 'time_precision_mode' in debezium_config:
-            properties['time.precision.mode'] = debezium_config['time_precision_mode']
-        
-        return properties
-    
     def get_source_db_config(self) -> Dict[str, Any]:
         """Get source database configuration"""
         return self.config['source_database']
@@ -216,7 +149,7 @@ class Settings:
     
     def get_batch_size(self) -> int:
         """Get batch processing size"""
-        return self.config['application'].get('batch_size', 100)
+        return self.config['application'].get('batch_size', 5000)
     
     def get_retry_config(self) -> Dict[str, int]:
         """Get retry configuration"""
@@ -228,11 +161,6 @@ class Settings:
     def __repr__(self) -> str:
         """String representation (hide sensitive data)"""
         safe_config = self.config.copy()
-        
-        # Hide sensitive fields
-        if 'debezium' in safe_config:
-            if 'database_password' in safe_config['debezium']:
-                safe_config['debezium']['database_password'] = '***'
         
         if 'source_database' in safe_config:
             if 'password' in safe_config['source_database']:
@@ -266,11 +194,11 @@ def create_default_config(output_path: str = "config/config.yaml"):
 application:
   instance_id: "sensor_sync_001"
   log_level: "INFO"
-  batch_size: 100
+  batch_size: 5000
   retry_attempts: 3
   retry_delay_seconds: 5
 
-debezium:
+change_detection:
   connector_class: "io.debezium.connector.postgresql.PostgresConnector"
   database_hostname: "localhost"
   database_port: 5432
@@ -305,6 +233,7 @@ mqtt:
   qos: 2
   keepalive: 60
   reconnect_delay_seconds: 5
+  client_id: "sensor_sync_client"
 
 source_database:
   type: "postgresql"

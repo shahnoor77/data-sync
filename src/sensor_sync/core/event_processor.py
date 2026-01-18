@@ -37,15 +37,7 @@ class EventProcessor:
         self.metrics = metrics
     
     def process_event(self, raw_event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Process a CDC event
-        
-        Args:
-            raw_event: Raw event from Debezium
-            
-        Returns:
-            Processed event ready for MQTT publishing, or None if should be skipped
-        """
+        """Process a CDC event (now from ChangeDetector instead of Debezium)"""
         start_time = time.time()
         
         try:
@@ -62,13 +54,12 @@ class EventProcessor:
                 'CAPTURED',
                 data={
                     'table': source.get('table'),
-                    'lsn': source.get('lsn'),
                     'timestamp': source.get('ts_ms')
                 }
             )
             
             # Extract operation
-            operation = payload.get('op')  # c=create, u=update, d=delete, r=read
+            operation = payload.get('op')
             
             if not operation:
                 self.logger.warning("Event has no operation, skipping", event_id=event_id)
@@ -80,14 +71,8 @@ class EventProcessor:
                 self.logger.warning("Event has no table, skipping", event_id=event_id)
                 return None
             
-            # Extract data based on operation
-            if operation in ['c', 'r', 'u']:  # Create, Read, Update
-                data = payload.get('after', {})
-            elif operation == 'd':  # Delete
-                data = payload.get('before', {})
-            else:
-                self.logger.warning(f"Unknown operation: {operation}", event_id=event_id)
-                return None
+            # Extract data
+            data = payload.get('after', {})
             
             if not data:
                 self.logger.warning("Event has no data, skipping", event_id=event_id)

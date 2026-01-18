@@ -1,45 +1,67 @@
 application:
   instance_id: "${INSTANCE_ID}"
   log_level: "${LOG_LEVEL}"
-  batch_size: 100
-  retry_attempts: 3
+  batch_size: 5000
+  retry_attempts: 5
   retry_delay_seconds: 5
+  enable_metrics: true
+  metrics_port: 9090
 
-debezium:
-  connector_class: "io.debezium.connector.postgresql.PostgresConnector"
-  database_hostname: "${SOURCE_DB_HOST}"
-  database_port: "${SOURCE_DB_PORT}"
-  database_user: "${SOURCE_DB_USER}"
-  database_password: "${SOURCE_DB_PASSWORD}"
-  database_dbname: "${SOURCE_DB_NAME}"
-  database_server_name: "sensor_source_server"
-  plugin_name: "pgoutput"
-  slot_name: "sensor_cdc_slot"
-  publication_name: "sensor_publication"
-  
-  offset_storage: "org.apache.kafka.connect.storage.FileOffsetBackingStore"
-  offset_storage_file_filename: "/app/data/offsets/offset.dat"
-  offset_flush_interval_ms: 10000
-  
-  schema_history_internal: "io.debezium.storage.file.history.FileSchemaHistory"
-  schema_history_internal_file_filename: "/app/data/history/schema_history.dat"
-  
-  snapshot_mode: "initial"
-  decimal_handling_mode: "string"
-  time_precision_mode: "adaptive"
-  
-  table_include_list: "public.sensor_readings,public.temperature_sensors,public.pressure_sensors"
+# Database change detection (polling or CDC via WAL)
+change_detection:
+  mode: "wal_polling"
+  poll_interval_seconds: 5
+  batch_size: 5000
+  max_queue_size: 50000
+  enable_snapshot_on_start: true
 
 mqtt:
+  # EMQX Configuration with Stable IDs
   broker_host: "${MQTT_BROKER_HOST}"
   broker_port: "${MQTT_BROKER_PORT}"
   username: "${MQTT_USERNAME}"
   password: "${MQTT_PASSWORD}"
-  topic_prefix: "${MQTT_TOPIC_PREFIX}"
-  ack_topic: "sensors/ack"
-  qos: 2
+  
+  # FIXED client IDs for session persistence
+  client_id_publisher: "prod_publisher_01"
+  client_id_subscriber: "prod_subscriber_01"
+  
+  # EMQX-Specific Settings
+  protocol_version: 5
   keepalive: 60
-  reconnect_delay_seconds: 5
+  reconnect_min_interval: 1
+  reconnect_max_interval: 30
+  max_reconnect_attempts: -1
+  
+  # Session Persistence (MQTT 5.0)
+  clean_session: false
+  session_expiry_interval: 86400
+  
+  # High-Throughput Settings
+  qos_publish: 2
+  qos_subscribe: 2
+  max_inflight_messages: 200  # Increased from 100
+  max_mqueue_len: 100000  # Max message queue
+  message_ordering: true
+  
+  # Topic Configuration
+  topic_prefix: "${MQTT_TOPIC_PREFIX}"
+  topic_bulk: "${MQTT_TOPIC_PREFIX}/bulk"  # For batch publishing
+  ack_topic: "sensors/ack"
+  status_topic: "sensors/status"
+  error_topic: "sensors/errors"
+  
+  # Performance Settings
+  message_timeout_seconds: 30
+  max_queued_messages: 10000
+  connection_timeout: 30
+  socket_keepalive: true
+  
+  # Batch Publishing
+  batch_publish_enabled: true
+  batch_publish_interval_ms: 500  # Reduced for faster throughput
+  batch_publish_size: 500  # Increased batch size
+  batch_use_bulk_topic: true
 
 source_database:
   type: "${SOURCE_DB_TYPE}"
@@ -48,6 +70,12 @@ source_database:
   database: "${SOURCE_DB_NAME}"
   user: "${SOURCE_DB_USER}"
   password: "${SOURCE_DB_PASSWORD}"
+  connection_timeout: 30
+  pool_size: 10
+  monitored_tables:
+    - "public.sensor_readings"
+    - "public.temperature_sensors"
+    - "public.pressure_sensors"
 
 target_database:
   type: "${TARGET_DB_TYPE}"
@@ -56,17 +84,41 @@ target_database:
   database: "${TARGET_DB_NAME}"
   user: "${TARGET_DB_USER}"
   password: "${TARGET_DB_PASSWORD}"
+  connection_timeout: 30
+  pool_size: 20
+  bulk_batch_size: 1000
 
 security:
   encryption_key: "${ENCRYPTION_KEY}"
   signing_key: "${SIGNING_KEY}"
   enable_encryption: true
+  enable_compression: true
   sensitive_fields:
     - "device_id"
     - "location"
     - "metadata"
 
 monitoring:
-  enable_metrics: true
-  metrics_port: 9090
+  enable_prometheus: true
+  prometheus_port: 9090
   health_check_interval: 30
+  enable_slow_query_logging: true
+  slow_query_threshold_ms: 1000
+  log_every_n_messages: 10000  # Health log frequency
+
+dead_letter_queue:
+  enabled: true
+  storage_type: "file"
+  retention_days: 7
+  max_retries: 5
+  exponential_backoff: true
+  backoff_base: 2
+  backoff_max_delay: 3600
+
+reliability:
+  enable_persistence: true
+  persist_delivery_attempts: true
+  persist_message_state: true
+  message_retention_period: 86400
+  duplicate_detection: true
+  duplicate_window: 300
