@@ -1,40 +1,68 @@
-import json
 import time
+import json
 import uuid
-from paho.mqtt import client as mqtt
-from paho.mqtt.enums import CallbackAPIVersion
+import multiprocessing
+import paho.mqtt.client as mqtt
+from datetime import datetime
 
-# --- CONFIG ---
+# --- CONFIGURATION ---
 BROKER = "emqx"
-TOPIC = "sensors/data/bulk/sensor_readings"
-RECORDS_PER_SECOND = 2000  # A realistic high-load live stream
-BATCH_SIZE = 200           # Smaller batches for real-time feel
+PORT = 1883
+TOTAL_MESSAGES = 1000000  # 1 Million messages
+PROCESS_COUNT = 4         # Adjust based on your CPU cores
+TOPIC = "sensors/industrial/data"
 
-client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2, protocol=mqtt.MQTTv5)
-
-def run_live_stream():
-    client.connect(BROKER, 1883, keepalive=120)
-    client.loop_start()
-    print(f"📡 Live Stream Simulator Active: {RECORDS_PER_SECOND} msg/sec")
+def run_load_worker(worker_id, count):
+    """Worker process to hammer the broker"""
+    client = mqtt.Client(
+        client_id=f"generator_{worker_id}_{uuid.uuid4().hex[:4]}",
+        protocol=mqtt.MQTTv311  # Matching your stable subscriber
+    )
+    
+    # High-throughput tuning
+    client.max_inflight_messages_set(2000)
     
     try:
-        while True:
-            batch = []
-            for _ in range(BATCH_SIZE):
-                batch.append({
-                    "event_id": str(uuid.uuid4()),
-                    "table": "sensor_readings",
-                    "data": {"val": 25.5, "ts": time.time()},
-                    "type": "LIVE_STREAM"
-                })
+        client.connect(BROKER, PORT, keepalive=60)
+        client.loop_start()
+        
+        for i in range(count):
+            payload = {
+                "s_id": f"sensor_{worker_id}",
+                "val": 25.5 + (i % 100),
+                "ts": datetime.utcnow().isoformat(),
+                "seq": i,
+                "sig": "valid_signature_placeholder" # To pass your crypto check
+            }
             
-            client.publish(TOPIC, json.dumps({"message": batch}), qos=1)
+            # QoS 0 is used for maximum "firehose" testing
+            client.publish(TOPIC, json.dumps(payload), qos=0)
             
-            # This maintains the steady flow rate
-            time.sleep(BATCH_SIZE / RECORDS_PER_SECOND) 
-            
-    except KeyboardInterrupt:
+            if i % 10000 == 0:
+                print(f"Worker {worker_id}: Sent {i}/{count}")
+
         client.loop_stop()
+        client.disconnect()
+    except Exception as e:
+        print(f"Worker {worker_id} Error: {e}")
 
 if __name__ == "__main__":
-    run_live_stream()
+    msgs_per_worker = TOTAL_MESSAGES // PROCESS_COUNT
+    
+    print(f"🚀 Starting Stress Test: {TOTAL_MESSAGES} messages via {PROCESS_COUNT} processes")
+    start_time = time.time()
+    
+    processes = []
+    for i in range(PROCESS_COUNT):
+        p = multiprocessing.Process(target=run_load_worker, args=(i, msgs_per_worker))
+        p.start()
+        processes.append(p)
+    
+    for p in processes:
+        p.join()
+        
+    end_time = time.time()
+    duration = end_time - start_time
+    print("\n--- TEST COMPLETE ---")
+    print(f"Total Time: {duration:.2f} seconds")
+    print(f"Avg Throughput: {TOTAL_MESSAGES / duration:.2f} records/sec")

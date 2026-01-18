@@ -9,6 +9,8 @@ import threading
 import queue
 from typing import Dict, Any, List
 import paho.mqtt.client as mqtt
+from paho.mqtt.packettypes import PacketTypes
+from paho.mqtt.properties import Properties
 from ..database.connector import create_connector
 from ..database.schema_manager import SchemaManager
 from ..utils.crypto import CryptoManager
@@ -91,13 +93,21 @@ class EMQXSubscriber:
         
         self.client = mqtt.Client(
             client_id=self.client_id,
-            protocol=mqtt.MQTTv5
+            protocol=mqtt.MQTTv311,
+            clean_session=False
         )
-        
+        # Set max packet size
+        self.connect_properties = Properties(PacketTypes.CONNECT)
+        self.connect_properties.MaximumPacketSize = 2097152  # 2 MB
         # Set max in-flight
         self.client.max_inflight_messages_set(
-            self.mqtt_config.get('max_inflight_messages', 200)
+            self.mqtt_config.get('max_inflight_messages', 1000)
         )
+        try:
+            import socket
+            self.client._socket_setbuf(socket.SO_RCVBUF, 4 * 1024 * 1024)
+        except Exception as e:
+            self.logger.warning(f"Could not expand socket buffer: {e}")
         
         # Set callbacks
         self.client.on_connect = self._on_connect
@@ -142,7 +152,8 @@ class EMQXSubscriber:
                     broker_host,
                     broker_port,
                     keepalive,
-                    clean_start=False
+                    clean_session=False,
+                    properties=self.connect_properties
                 )
                 
                 self.client.loop_start()
@@ -221,21 +232,25 @@ class EMQXSubscriber:
         ONLY puts raw payload in queue - NO parsing here
         """
         try:
-            # Add raw payload to queue without blocking MQTT loop
-            # Store topic info for later processing
+            raw_payload = msg.payload.decode('utf-8', errors='replace')
+            if self.message_queue.full():
+                try:
+                    self.message_queue.get_nowait()
+                    self.metrics.increment_counter('droped_message_overflow')
+                except queue.Empty:
+                    pass
+                # Add raw payload to queue without blocking MQTT loop
+                # Store topic info for later processing
             self.message_queue.put_nowait({
-                'payload': msg.payload,  # Raw bytes
+                'payload': raw_payload,  # Raw bytes
                 'topic': msg.topic,
                 'qos': msg.qos,
                 'timestamp': time.time()
-            })
-            
-        except queue.Full:
-            self.logger.warning("Message queue full, dropping message")
-            self.metrics.increment_counter('dropped_messages')
+                })
         except Exception as e:
-            self.logger.error(f"Error queuing message: {e}", exc_info=True)
-    
+            self.logger.error(f"Critical error in MQTT callback: {e}", exc_info=True)
+            
+        
     def _start_writer_thread(self):
         """Start background database writer thread"""
         self.writer_thread_running = True
@@ -286,7 +301,11 @@ class EMQXSubscriber:
         """
         try:
             # DECODE from bytes to string
-            payload = msg_data['payload'].decode('utf-8')
+            payload_bytes = msg_data['payload']
+            payload = payload_bytes.decode('utf-8', errors='replace')
+            if '\ufffd' in payload:
+                self.logger.warning("Dropped corrupted/partial packet (Unicode error)")
+                return
             
             # Handle bulk batch
             if 'batch_id' in payload and msg_data['topic'].endswith('/bulk'):
