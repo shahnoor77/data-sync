@@ -1,11 +1,16 @@
 """
-Main application entry point - Pure MQTT-based data sync
-NO Debezium - Uses native database polling
+Level 3: Multi-Instance Parallelism (System Scaling)
+Main application entry point with process factory for parallel instances
+- Process Factory: Launch parallel processes using multiprocessing
+- Topic Isolation: Process 1 (sensors/live/#), Process 2 (sensors/db/#)
+- Collision Prevention: Unique client_id per process
 """
 
 import sys
 import signal
 import time
+import multiprocessing
+import os
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -213,13 +218,19 @@ class PublisherApplication:
 
 class SubscriberApplication:
     """
-    Subscriber: Receives from MQTT -> Writes to target database
+    Level 2: High-Throughput Subscriber with Internal Decoupling
+    Level 3: Multi-Instance support with topic isolation
     """
     
-    def __init__(self, config_file: str = "config/config.yaml"):
-        """Initialize subscriber application"""
+    def __init__(self, config_file: str = "config/config.yaml", instance_id: str = None, topic_filter: str = None):
+        """Initialize subscriber application with Level 3 multi-instance support"""
+        self.instance_id = instance_id or os.getenv('INSTANCE_ID', 'subscriber_001')
+        self.topic_filter = topic_filter or "sensors/data/#"  # Default topic
+        
         print("=" * 70)
-        print("  SENSOR SYNC SUBSCRIBER - MQTT to Database Writer")
+        print(f"  LEVEL 2+3: HIGH-THROUGHPUT SUBSCRIBER - {self.instance_id}")
+        print(f"  Topic Filter: {self.topic_filter}")
+        print(f"  Features: Internal Decoupling, MySQL Persistence, Quantum Processing")
         print("=" * 70)
         
         # Load configuration
@@ -227,10 +238,10 @@ class SubscriberApplication:
         self.settings = Settings(config_file)
         print("✓ Configuration loaded")
         
-        # Setup logger
+        # Setup logger with instance ID
         print("\n[2/6] Setting up logging...")
         self.logger = StructuredLogger(
-            name="sensor_sync_subscriber",
+            name=f"sensor_sync_{self.instance_id}",
             log_dir="logs",
             level=self.settings.get('application.log_level', 'INFO')
         )
@@ -260,23 +271,29 @@ class SubscriberApplication:
         )
         print("✓ DLQ ready")
         
-        # Setup MQTT subscriber (EMQX)
-        print("\n[6/6] Setting up EMQX subscriber...")
+        # Setup MQTT subscriber with Level 3 unique client_id
+        print("\n[6/6] Setting up Level 2+3 EMQX subscriber...")
+        mqtt_config = self.settings.get_mqtt_config()
+        
+        # Level 3: Collision Prevention - Unique client_id per process
+        mqtt_config['client_id_subscriber'] = f"{self.instance_id}_{os.getpid()}"
+        mqtt_config['topic_prefix'] = self.topic_filter.replace('/#', '')
+        
         self.mqtt_subscriber = EMQXSubscriber(
-            mqtt_config=self.settings.get_mqtt_config(),
+            mqtt_config=mqtt_config,
             target_db_config=self.settings.get_target_db_config(),
             crypto_manager=self.crypto,
             dlq=self.dlq,
             logger=self.logger,
             metrics=self.metrics
         )
-        print("✓ MQTT subscriber ready")
+        print("✓ Level 2+3 MQTT subscriber ready")
         
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         
-        print("\n✓ Subscriber initialized successfully!")
+        print(f"\n✓ Level 2+3 Subscriber initialized: {self.instance_id}")
         print("=" * 70)
     
     def _signal_handler(self, signum, frame):
@@ -286,18 +303,19 @@ class SubscriberApplication:
         sys.exit(0)
     
     def start(self):
-        """Start the subscriber"""
+        """Start the Level 2+3 subscriber"""
         try:
             self.logger.info("=" * 70)
-            self.logger.info("Starting Subscriber")
+            self.logger.info(f"Starting Level 2+3 Subscriber: {self.instance_id}")
+            self.logger.info(f"Topic Filter: {self.topic_filter}")
             self.logger.info("=" * 70)
             
             # Connect to MQTT broker
             self.logger.info("Connecting to MQTT broker...")
             self.mqtt_subscriber.connect()
             
-            self.logger.info("✓ Subscriber started successfully!")
-            self.logger.info("Waiting for CDC events...")
+            self.logger.info(f"✓ Level 2+3 Subscriber started: {self.instance_id}")
+            self.logger.info("Processing CDC events with internal decoupling...")
             
             # Run subscriber (blocking)
             self.mqtt_subscriber.run()
@@ -311,33 +329,139 @@ class SubscriberApplication:
             raise
     
     def stop(self):
-        """Stop the subscriber"""
-        self.logger.info("Stopping Subscriber...")
+        """Stop the Level 2+3 subscriber"""
+        self.logger.info(f"Stopping Level 2+3 Subscriber: {self.instance_id}...")
         
         if self.mqtt_subscriber:
             self.mqtt_subscriber.disconnect()
         
-        self.logger.info("✓ Subscriber stopped successfully")
+        self.logger.info(f"✓ Level 2+3 Subscriber stopped: {self.instance_id}")
+
+
+def run_subscriber_process(instance_id: str, topic_filter: str):
+    """
+    Level 3: Process Factory function for running subscriber instances
+    Each process gets unique client_id and topic isolation
+    """
+    try:
+        print(f"Level 3: Starting subscriber process {instance_id} for {topic_filter}")
+        
+        # Set environment variables for this process
+        os.environ['INSTANCE_ID'] = instance_id
+        
+        # Create and start subscriber
+        app = SubscriberApplication(instance_id=instance_id, topic_filter=topic_filter)
+        app.start()
+        
+    except Exception as e:
+        print(f"Level 3: Subscriber process {instance_id} failed: {e}")
+        raise
+
+
+def start_multi_instance_subscribers():
+    """
+    Level 3: Multi-Instance Parallelism with "Quiet Start"
+    Launch parallel subscriber processes with staggered start to prevent thundering herd
+    """
+    print("=" * 70)
+    print("  LEVEL 3: MULTI-INSTANCE PARALLELISM WITH QUIET START")
+    print("  Process Factory with Topic Isolation + Staggered Launch")
+    print("=" * 70)
+    
+    # Level 3: Topic Isolation Configuration
+    subscriber_configs = [
+        {
+            'instance_id': 'sub_live_01',
+            'topic_filter': 'sensors/live/#',  # Real-time stream
+            'description': 'Real-time sensor data processor',
+            'stagger_delay': 0  # First instance starts immediately
+        },
+        {
+            'instance_id': 'sub_db_01', 
+            'topic_filter': 'sensors/db/#',    # Batch database sync
+            'description': 'Batch database sync processor',
+            'stagger_delay': 2  # Second instance waits 2 seconds
+        }
+    ]
+    
+    processes = []
+    
+    try:
+        # Launch parallel processes with staggered start
+        for i, config in enumerate(subscriber_configs):
+            print(f"\nLevel 3: Launching {config['instance_id']} - {config['description']}")
+            print(f"Topic: {config['topic_filter']}")
+            
+            # Quiet Start: Staggered launch to prevent thundering herd
+            if config['stagger_delay'] > 0:
+                print(f"Quiet Start: Waiting {config['stagger_delay']}s to prevent collision...")
+                time.sleep(config['stagger_delay'])
+            
+            process = multiprocessing.Process(
+                target=run_subscriber_process,
+                args=(config['instance_id'], config['topic_filter']),
+                name=config['instance_id']
+            )
+            process.start()
+            processes.append(process)
+            
+            print(f"✓ Process {config['instance_id']} started (PID: {process.pid})")
+        
+        print(f"\n✓ Level 3: All {len(processes)} subscriber processes launched with Quiet Start")
+        print("Collision Prevention: Each process has unique client_id + staggered launch")
+        print("Topic Isolation: Real-time vs Batch processing")
+        
+        # Wait for all processes
+        for process in processes:
+            process.join()
+            
+    except KeyboardInterrupt:
+        print("\nLevel 3: Shutting down all subscriber processes...")
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        print("✓ Level 3: All processes stopped")
+        
+    except Exception as e:
+        print(f"Level 3: Error in multi-instance setup: {e}")
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        raise
 
 
 def main():
-    """Main entry point"""
+    """
+    Level 3: Main entry point with Process Factory
+    Supports both single instance and multi-instance parallelism
+    """
     import os
     
     # Check service mode from environment
     service_mode = os.getenv('SERVICE_MODE', 'publisher').lower()
+    multi_instance = os.getenv('MULTI_INSTANCE', 'false').lower() == 'true'
     
     if service_mode == 'publisher':
         # Run publisher (CDC -> MQTT)
         app = PublisherApplication()
         app.start()
+        
     elif service_mode == 'subscriber':
-        # Run subscriber (MQTT -> Target DB)
-        app = SubscriberApplication()
-        app.start()
+        if multi_instance:
+            # Level 3: Multi-Instance Parallelism
+            start_multi_instance_subscribers()
+        else:
+            # Single instance subscriber
+            instance_id = os.getenv('INSTANCE_ID', 'subscriber_001')
+            topic_filter = os.getenv('TOPIC_FILTER', 'sensors/data/#')
+            app = SubscriberApplication(instance_id=instance_id, topic_filter=topic_filter)
+            app.start()
+            
     else:
         print(f"Unknown service mode: {service_mode}")
         print("Set SERVICE_MODE environment variable to 'publisher' or 'subscriber'")
+        print("For Level 3 multi-instance: Set MULTI_INSTANCE=true")
         sys.exit(1)
 
 

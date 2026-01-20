@@ -144,7 +144,7 @@ class ChangeDetector:
     def _query_changes(self) -> List[Dict[str, Any]]:
         """
         Query for recent changes from all monitored tables
-        Handles transaction errors gracefully
+        Enhanced with trace_id generation at the moment of database change detection
         """
         changes = []
         
@@ -181,8 +181,12 @@ class ChangeDetector:
                 results = cursor.fetchall()
                 cursor.close()
                 
-                # Process results
+                # Process results with trace_id generation
                 for row in results:
+                    # Enhanced Traceability: Generate trace_id at the moment of database change detection
+                    trace_id = str(uuid.uuid4())
+                    detection_timestamp = time.time_ns() / 1_000_000_000  # High-precision timestamp
+                    
                     event = {
                         'payload': {
                             'source': {
@@ -193,10 +197,21 @@ class ChangeDetector:
                                 'schema': 'public'
                             },
                             'op': row['operation'],  # Debezium-compatible
-                            'after': dict(row['after']) if row['after'] else None
+                            'after': dict(row['after']) if row['after'] else None,
+                            # Enhanced Traceability: Add trace_id and detection metadata
+                            'trace_id': trace_id,
+                            'detected_at': detection_timestamp,
+                            'detector_instance': 'change_detector_001'
                         }
                     }
                     changes.append(event)
+                    
+                    # Log trace_id generation for debugging
+                    if self.logger:
+                        self.logger.debug(
+                            f"Enhanced Traceability: Generated trace_id {trace_id} "
+                            f"for {row['table_name']} change detection"
+                        )
                 
             except psycopg2.Error as e:
                 # Log the error but don't crash

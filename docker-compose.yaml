@@ -24,28 +24,37 @@ services:
     networks:
       - sensor_network
 
-  # MongoDB - Target
-  mongodb-target:
-    image: mongo:7.0
-    container_name: mongodb_target
+  # Level 1 & 5: MySQL Target Database with Health Check and Persistence
+  mysql-target:
+    image: mysql:8.0
+    container_name: mysql_target
     env_file: .env
     environment:
-      - MONGO_INITDB_ROOT_USERNAME=${TARGET_DB_USER}
-      - MONGO_INITDB_ROOT_PASSWORD=${TARGET_DB_PASSWORD}
-      - MONGO_INITDB_DATABASE=${TARGET_DB_NAME}
+      - MYSQL_ROOT_PASSWORD=${TARGET_DB_PASSWORD}
+      - MYSQL_DATABASE=${TARGET_DB_NAME}
+      - MYSQL_USER=${TARGET_DB_USER}
+      - MYSQL_PASSWORD=${TARGET_DB_PASSWORD}
     ports:
-      - "27017:27017"
+      - "3306:3306"
     volumes:
-      - mongodb_target_data:/data/db
+      # Level 5: Persistence - MySQL data survives container restart
+      - mysql_target_data:/var/lib/mysql
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --innodb-buffer-pool-size=512M
+      --max-connections=200
+      --innodb-log-file-size=256M
     healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      # Level 5: Health Dependency - MySQL health check
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${TARGET_DB_PASSWORD}"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
     networks:
       - sensor_network
 
-  # EMQX Broker - Production MQTT
+  # EMQX Broker - Production MQTT with Global Self-Healing
   emqx:
     image: emqx/emqx:5.2
     container_name: emqx_broker
@@ -62,7 +71,13 @@ services:
       - EMQX_DASHBOARD__DEFAULT_USERNAME=admin
       - EMQX_DASHBOARD__DEFAULT_PASSWORD=public
       - EMQX_PERSISTENCE__MESSAGES__STORAGE_TYPE=ram
+      # Global Self-Healing: QoS 2 handshake persistence
+      - EMQX_MQTT__MAX_INFLIGHT=10000
+      - EMQX_MQTT__MAX_AWAITING_REL=10000
+      - EMQX_MQTT__AWAIT_REL_TIMEOUT=300s
+      - EMQX_MQTT__SESSION_EXPIRY_INTERVAL=7200s
     volumes:
+      # Global Self-Healing: Persistence for QoS 2 handshakes during restarts
       - emqx_data:/opt/emqx/data
       - emqx_etc:/opt/emqx/etc
       - emqx_log:/opt/emqx/log
@@ -74,7 +89,7 @@ services:
     networks:
       - sensor_network
 
-  # MQTT Publisher (CDC -> EMQX)
+  # Level 0: Production Publisher with Resilient Ingestion
   mqtt-publisher:
     build: .
     container_name: mqtt_publisher
@@ -96,23 +111,54 @@ services:
       - sensor_network
     restart: on-failure
 
-  # MQTT Subscriber (EMQX -> Target DB)
-  mqtt-subscriber:
+  # Level 2+3: High-Throughput Subscriber - Real-time Stream
+  mqtt-subscriber-live:
     build: .
-    container_name: mqtt_subscriber
+    container_name: mqtt_subscriber_live
     env_file: .env
     environment:
       - SERVICE_MODE=subscriber
-      - INSTANCE_ID=subscriber_001
+      - INSTANCE_ID=sub_live_01
+      - TOPIC_FILTER=sensors/live/#
       - MQTT_BROKER=emqx
     depends_on:
-      mongodb-target:
+      # Level 5: Health Dependency - Subscriber waits for MySQL health
+      mysql-target:
         condition: service_healthy
       emqx:
         condition: service_healthy
     volumes:
       - ./data/dlq:/app/data/dlq
       - ./logs:/app/logs
+    # Level 5: Resources - Memory and CPU limits for RSA verification
+    mem_limit: 1gb
+    cpus: 1.5
+    networks:
+      - sensor_network
+    restart: on-failure
+
+  # Level 3: Multi-Instance - Batch Database Sync Processor
+  mqtt-subscriber-db:
+    build: .
+    container_name: mqtt_subscriber_db
+    env_file: .env
+    environment:
+      - SERVICE_MODE=subscriber
+      - INSTANCE_ID=sub_db_01
+      - TOPIC_FILTER=sensors/db/#
+      - MQTT_BROKER=emqx
+    depends_on:
+      # Level 5: Health Dependency - Subscriber waits for MySQL health
+      mysql-target:
+        condition: service_healthy
+      emqx:
+        condition: service_healthy
+    volumes:
+      - ./data/dlq:/app/data/dlq
+      - ./logs:/app/logs
+    # Level 5: Resources - Memory and CPU limits
+    mem_limit: 1gb
+    cpus: 1.5
     networks:
       - sensor_network
     restart: on-failure
@@ -123,7 +169,8 @@ networks:
 
 volumes:
   postgres_source_data:
-  mongodb_target_data:
+  # Level 5: Persistence - MySQL data volume for 1M+ records survival
+  mysql_target_data:
   emqx_data:
   emqx_etc:
   emqx_log:

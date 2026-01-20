@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+# Install high-performance packages with C-extensions
+RUN pip install paho-mqtt cryptography
+
+# Copy source code
+COPY src/ ./src/
+COPY live_test.py ./
+
+# Environment variables
+ENV PYTHONPATH=/
+ENV TOTAL_MESSAGES=1000000
+ENV CONCURRENCY=4
+ENV TARGET_TOPIC=sensors/live/stress_test
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python", "live_test.py"]
