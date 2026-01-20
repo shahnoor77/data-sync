@@ -44,9 +44,12 @@ class DeadLetterQueue:
     ):
         """Add failed message to DLQ"""
         try:
+            # AttributeError Fix: Check if message_type has .value attribute
+            m_type = message_type.value if hasattr(message_type, 'value') else message_type
+            
             dlq_entry = {
                 'event_id': event_id,
-                'message_type': message_type.value,
+                'message_type': m_type,
                 'payload': payload,
                 'error': error,
                 'retry_count': retry_count,
@@ -61,11 +64,12 @@ class DeadLetterQueue:
             self.logger.warning(
                 f"Message added to DLQ: {event_id}",
                 event_id=event_id,
-                message_type=message_type.value,
+                message_type=m_type,
                 error=error
             )
             
         except Exception as e:
+            # General Robustness: Wrap DLQ operations in try-except
             self.logger.error(f"Failed to add message to DLQ: {e}", exc_info=True)
     
     def get_pending_messages(self) -> List[Dict[str, Any]]:

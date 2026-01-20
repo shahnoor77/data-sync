@@ -1,62 +1,112 @@
--- Create replication user for Debezium
-CREATE ROLE debezium_user WITH REPLICATION LOGIN PASSWORD 'debezium123';
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO debezium_user;
-GRANT USAGE ON SCHEMA public TO debezium_user;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO debezium_user;
+-- ============================================================================
+-- SENSOR SYNC - SOURCE DATABASE INITIALIZATION
+-- Optimized for: Python Incremental Polling, .NET compatibility, and Future CDC
+-- ============================================================================
 
--- Create publication for CDC
-CREATE PUBLICATION sensor_publication FOR ALL TABLES;
+-- 1. SECURITY & REPLICATION SETUP
+-- Create a dedicated replication user (useful for future Debezium/WAL access)
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'replication_user') THEN
+        CREATE ROLE replication_user WITH REPLICATION LOGIN PASSWORD 'prod_pass_123';
+    END IF;
+END $$;
 
--- Create sensor tables
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO replication_user;
+GRANT USAGE ON SCHEMA public TO replication_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO replication_user;
+
+-- 2. AUTOMATION: UPDATED_AT TRIGGER FUNCTION
+-- This ensures that whenever a row is UPDATED, the timestamp changes automatically.
+-- This is the "secret sauce" that allows your Python Publisher to find changed data.
+CREATE OR REPLACE FUNCTION sync_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+-- 3. CORE DATA TABLES
+-- We use 'updated_at' as the primary bookmark for the Python Publisher.
+-- We use 'TIMESTAMP WITH TIME ZONE' to prevent time-drift issues in production.
+
+-- Table: Generic Sensor Readings
 CREATE TABLE IF NOT EXISTS sensor_readings (
     id SERIAL PRIMARY KEY,
     device_id VARCHAR(100) NOT NULL,
     sensor_type VARCHAR(50) NOT NULL,
-    value DECIMAL(10, 2) NOT NULL,
+    value DECIMAL(12, 4) NOT NULL,
     unit VARCHAR(20),
     location VARCHAR(200),
     metadata JSONB,
-    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Table: Temperature Sensors (Highly targeted for thermal monitoring)
 CREATE TABLE IF NOT EXISTS temperature_sensors (
     id SERIAL PRIMARY KEY,
     device_id VARCHAR(100) NOT NULL,
     temperature DECIMAL(5, 2) NOT NULL,
     humidity DECIMAL(5, 2),
     location VARCHAR(200),
-    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Table: Pressure Sensors (Optimized for high-precision pressure data)
 CREATE TABLE IF NOT EXISTS pressure_sensors (
     id SERIAL PRIMARY KEY,
     device_id VARCHAR(100) NOT NULL,
-    pressure DECIMAL(8, 2) NOT NULL,
-    altitude DECIMAL(8, 2),
+    pressure DECIMAL(10, 2) NOT NULL,
+    altitude DECIMAL(10, 2),
     location VARCHAR(200),
-    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- Create indexes
-CREATE INDEX idx_sensor_readings_device_id ON sensor_readings(device_id);
-CREATE INDEX idx_sensor_readings_timestamp ON sensor_readings(timestamp);
-CREATE INDEX idx_temperature_device_id ON temperature_sensors(device_id);
-CREATE INDEX idx_pressure_device_id ON pressure_sensors(device_id);
+-- 4. PERFORMANCE INDEXES
+-- CRITICAL: Without these, the Publisher will perform "Sequential Scans" 
+-- which will crash your database CPU during a 200k record/sec test.
+CREATE INDEX IF NOT EXISTS idx_readings_updated_at ON sensor_readings(updated_at);
+CREATE INDEX IF NOT EXISTS idx_readings_device_id ON sensor_readings(device_id);
 
--- Insert sample data
-INSERT INTO sensor_readings (device_id, sensor_type, value, unit, location, metadata) VALUES
-('SENSOR001', 'temperature', 23.5, 'celsius', 'Room A', '{"floor": 1, "building": "Main"}'),
-('SENSOR002', 'temperature', 24.1, 'celsius', 'Room B', '{"floor": 2, "building": "Main"}'),
-('SENSOR003', 'pressure', 101.3, 'kPa', 'Tank 1', '{"capacity": 1000, "type": "water"}'),
-('SENSOR004', 'humidity', 65.5, 'percent', 'Warehouse', '{"zone": "A", "section": 3}');
+CREATE INDEX IF NOT EXISTS idx_temp_updated_at ON temperature_sensors(updated_at);
+CREATE INDEX IF NOT EXISTS idx_temp_device_id ON temperature_sensors(device_id);
 
+CREATE INDEX IF NOT EXISTS idx_press_updated_at ON pressure_sensors(updated_at);
+CREATE INDEX IF NOT EXISTS idx_press_device_id ON pressure_sensors(device_id);
+
+-- 5. TRIGGER ACTIVATION
+-- Automatically update the 'updated_at' column on every UPDATE statement.
+DROP TRIGGER IF EXISTS trg_readings_updated_at ON sensor_readings;
+CREATE TRIGGER trg_readings_updated_at BEFORE UPDATE ON sensor_readings 
+FOR EACH ROW EXECUTE PROCEDURE sync_updated_at_column();
+
+DROP TRIGGER IF EXISTS trg_temp_updated_at ON temperature_sensors;
+CREATE TRIGGER trg_temp_updated_at BEFORE UPDATE ON temperature_sensors 
+FOR EACH ROW EXECUTE PROCEDURE sync_updated_at_column();
+
+DROP TRIGGER IF EXISTS trg_press_updated_at ON pressure_sensors;
+CREATE TRIGGER trg_press_updated_at BEFORE UPDATE ON pressure_sensors 
+FOR EACH ROW EXECUTE PROCEDURE sync_updated_at_column();
+
+-- 6. CDC / REPLICATION SLOT (Future-proofing)
+-- Creates a publication so that you can enable Debezium or .NET CDC later 
+-- without any schema changes.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'sensor_sync_pub') THEN
+        CREATE PUBLICATION sensor_sync_pub FOR ALL TABLES;
+    END IF;
+END $$;
+
+-- 7. SEED DATA (For initial validation)
 INSERT INTO temperature_sensors (device_id, temperature, humidity, location) VALUES
-('TEMP001', 22.5, 60.2, 'Server Room'),
-('TEMP002', 25.3, 55.8, 'Office Floor 1'),
-('TEMP003', 21.8, 62.1, 'Cold Storage');
+('TEMP-PROD-01', 22.5, 45.0, 'Data Center A'),
+('TEMP-PROD-02', 21.8, 48.2, 'Data Center B');
 
 INSERT INTO pressure_sensors (device_id, pressure, altitude, location) VALUES
-('PRESS001', 101.325, 0.0, 'Ground Level'),
-('PRESS002', 89.875, 1000.0, 'Roof Tank'),
-('PRESS003', 95.461, 500.0, 'Mid Level Tank');
+('PRESS-PROD-01', 1013.25, 0.0, 'Ground Station'),
+('PRESS-PROD-02', 980.50, 250.0, 'Elevated Tank');

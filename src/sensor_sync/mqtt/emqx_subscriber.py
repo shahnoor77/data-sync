@@ -94,18 +94,18 @@ class EMQXSubscriber:
         self.client = mqtt.Client(
             client_id=self.client_id,
             protocol=mqtt.MQTTv311,
-            clean_session=False
+            clean_session=False  # Session persistence for QoS reliability
         )
-        # Set max packet size
-        self.connect_properties = Properties(PacketTypes.CONNECT)
-        self.connect_properties.MaximumPacketSize = 2097152  # 2 MB
-        # Set max in-flight
-        self.client.max_inflight_messages_set(
-            self.mqtt_config.get('max_inflight_messages', 1000)
-        )
+        
+        # Set max in-flight messages to 2000 for maximum throughput
+        self.client.max_inflight_messages_set(2000)
+        
+        # Expand OS-level socket buffer to 4MB
         try:
             import socket
-            self.client._socket_setbuf(socket.SO_RCVBUF, 4 * 1024 * 1024)
+            self.client._sock_recv_buf = 4 * 1024 * 1024
+            if hasattr(self.client, '_socket'):
+                self.client._socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
         except Exception as e:
             self.logger.warning(f"Could not expand socket buffer: {e}")
         
@@ -129,11 +129,16 @@ class EMQXSubscriber:
         
         self.logger.info(
             f"EMQX subscriber configured with stable client_id: {self.client_id}, "
-            f"keepalive: 120s"
+            f"max_inflight: 2000, socket_buffer: 4MB, clean_session: False"
         )
     
     def connect(self):
         """Connect to EMQX broker"""
+        # Initialization Guard: Ensure database is connected before MQTT loop
+        if not self.target_db.is_connected():
+            self.logger.info("Database not connected, attempting to connect...")
+            self.target_db.connect()
+        
         max_retries = 5
         retry_count = 0
         
@@ -141,7 +146,7 @@ class EMQXSubscriber:
             try:
                 broker_host = self.mqtt_config['broker_host']
                 broker_port = int(self.mqtt_config['broker_port'])
-                keepalive = 120  # Increased from 60
+                keepalive = 120
                 
                 self.logger.info(
                     f"Connecting to EMQX: {broker_host}:{broker_port} "
@@ -151,9 +156,7 @@ class EMQXSubscriber:
                 self.client.connect(
                     broker_host,
                     broker_port,
-                    keepalive,
-                    clean_session=False,
-                    properties=self.connect_properties
+                    keepalive
                 )
                 
                 self.client.loop_start()
@@ -202,16 +205,12 @@ class EMQXSubscriber:
             self.connected = True
             self.logger.info("✓ EMQX subscriber connected")
             
-            # Subscribe to both individual and bulk topics
-            data_topic = f"{self.mqtt_config['topic_prefix']}/#"
-            bulk_topic = self.mqtt_config.get('topic_bulk', 
-                f"{self.mqtt_config['topic_prefix']}/bulk")
-            
-            client.subscribe(data_topic, qos=self.mqtt_config.get('qos_subscribe', 2))
-            client.subscribe(bulk_topic, qos=self.mqtt_config.get('qos_subscribe', 2))
-            
-            self.logger.info(f"✓ Subscribed to {data_topic} and {bulk_topic}")
-            
+            prefix = self.mqtt_config.get('topic_prefix', 'sensors/data')
+            if "${" in prefix or not prefix:
+                prefix = "sensors/data"
+            data_topic = f"{prefix}/#"
+            client.subscribe(data_topic, qos=1)
+            self.logger.info(f"subscribed to {data_topic} with QoS 1")
             self.metrics.set_gauge('mqtt_connected', 1)
         else:
             self.logger.error(f"Connection failed: {rc}")
@@ -228,26 +227,39 @@ class EMQXSubscriber:
     
     def _on_message(self, client, userdata, msg):
         """
-        Callback for incoming MQTT message
+        Callback for incoming MQTT message with LIFO drop policy
         ONLY puts raw payload in queue - NO parsing here
         """
         try:
+            # Loop Stability: Wrap MQTT topic access to catch UnicodeDecodeError
+            try:
+                topic = msg.topic
+            except UnicodeDecodeError as e:
+                self.logger.warning(f"Malformed topic, dropping packet: {e}")
+                return
+            
+            # Use 'replace' to prevent Unicode crashes during high-speed fragmentation
             raw_payload = msg.payload.decode('utf-8', errors='replace')
+            
+            # LIFO drop policy: if queue is full, drop oldest message
             if self.message_queue.full():
                 try:
+                    # Drop oldest message (LIFO policy)
                     self.message_queue.get_nowait()
-                    self.metrics.increment_counter('droped_message_overflow')
+                    self.metrics.increment_counter('dropped_message_overflow')
                 except queue.Empty:
                     pass
-                # Add raw payload to queue without blocking MQTT loop
-                # Store topic info for later processing
+            
+            # Add new message without blocking MQTT loop
             self.message_queue.put_nowait({
-                'payload': raw_payload,  # Raw bytes
-                'topic': msg.topic,
+                'payload': raw_payload,
+                'topic': topic,
                 'qos': msg.qos,
                 'timestamp': time.time()
-                })
+            })
+            
         except Exception as e:
+            # Shield MQTT loop from any crashes
             self.logger.error(f"Critical error in MQTT callback: {e}", exc_info=True)
             
         
@@ -300,59 +312,83 @@ class EMQXSubscriber:
         Called from writer thread, NOT from MQTT callback
         """
         try:
-            # DECODE from bytes to string
-            payload_bytes = msg_data['payload']
-            payload = payload_bytes.decode('utf-8', errors='replace')
+            # Defensive Type Handling: Check if payload is already a string
+            payload_raw = msg_data['payload']
+            if isinstance(payload_raw, str):
+                payload = payload_raw  # Already a string, do not decode
+            elif isinstance(payload_raw, bytes):
+                payload = payload_raw.decode('utf-8', errors='replace')
+            else:
+                payload = str(payload_raw)
+            
             if '\ufffd' in payload:
                 self.logger.warning("Dropped corrupted/partial packet (Unicode error)")
+                return
+            if not payload.strip():
                 return
             
             # Handle bulk batch
             if 'batch_id' in payload and msg_data['topic'].endswith('/bulk'):
                 self._process_bulk_batch(payload)
-            else:
-                # Handle individual message - NOW parse JSON
+                return
+            
+            # Handle individual message - parse JSON
+            try:
+                parsed_payload = json.loads(payload)
+            except json.JSONDecodeError as e:
+                self.logger.error(f"Invalid JSON: {e}. payload snippet: {payload[:50]}")
+                self.metrics.increment_counter('invalid_json')
+                return
+            
+            # Signature Verification Logic: Handle wrapped payload from stress tester
+            signed_event = None
+            if isinstance(parsed_payload, dict):
+                # Check if payload is wrapped as {"message": signed_event} from stress tester
+                if 'message' in parsed_payload and isinstance(parsed_payload['message'], dict):
+                    # Extract the signed event from the wrapper
+                    signed_event = parsed_payload['message']
+                else:
+                    # Direct signed event
+                    signed_event = parsed_payload
+            
+            if not signed_event:
+                self.logger.error("No valid signed event found in payload")
+                return
+            
+            # Verify signature using the correct SIGNING_KEY from .env
+            if not self.crypto.verify_signed_message(signed_event):
+                self.logger.error("Invalid signature rejected")
+                self.metrics.increment_counter('invalid_signatures')
+                return
+            
+            event = signed_event.get('message', {})
+            event_id = event.get('event_id')
+            
+            if not event_id:
+                self.logger.warning("Event missing event_id")
+                return
+            
+            # Check for duplicates
+            if self._is_duplicate(event_id):
+                self._send_acknowledgment(event_id, True, "Duplicate")
+                return
+            
+            # DECRYPT sensitive fields here
+            if 'data' in event:
                 try:
-                    signed_event = json.loads(payload)
-                except json.JSONDecodeError as e:
-                    self.logger.error(f"Invalid JSON in message: {e}")
-                    self.metrics.increment_counter('invalid_json')
+                    event['data'] = self.crypto.decrypt_sensitive_fields(event['data'])
+                except Exception as e:
+                    self.logger.error(f"Decryption error for {event_id}: {e}")
+                    self._send_acknowledgment(event_id, False, f"Decryption error: {e}")
                     return
-                
-                # Verify signature
-                if not self.crypto.verify_signed_message(signed_event):
-                    self.logger.error("Invalid signature rejected")
-                    self.metrics.increment_counter('invalid_signatures')
-                    return
-                
-                event = signed_event.get('message', {})
-                event_id = event.get('event_id')
-                
-                if not event_id:
-                    self.logger.warning("Event missing event_id")
-                    return
-                
-                # Check for duplicates
-                if self._is_duplicate(event_id):
-                    self._send_acknowledgment(event_id, True, "Duplicate")
-                    return
-                
-                # DECRYPT sensitive fields here
-                if 'data' in event:
-                    try:
-                        event['data'] = self.crypto.decrypt_sensitive_fields(event['data'])
-                    except Exception as e:
-                        self.logger.error(f"Decryption error for {event_id}: {e}")
-                        self._send_acknowledgment(event_id, False, f"Decryption error: {e}")
-                        return
-                
-                # Add to buffer
-                with self.buffer_lock:
-                    self.message_buffer.append({
-                        'event_id': event_id,
-                        'event': event,
-                        'timestamp': time.time()
-                    })
+            
+            # Add to buffer
+            with self.buffer_lock:
+                self.message_buffer.append({
+                    'event_id': event_id,
+                    'event': event,
+                    'timestamp': time.time()
+                })
             
         except Exception as e:
             self.logger.error(f"Error processing message: {e}", exc_info=True)
@@ -372,13 +408,26 @@ class EMQXSubscriber:
             self.logger.debug(f"Processing bulk batch of {len(events)} events")
             
             for event_envelope in events:
-                # Verify signature for each event
-                if not self.crypto.verify_signed_message(event_envelope):
+                # Handle wrapped payload from stress tester
+                signed_event = None
+                if isinstance(event_envelope, dict):
+                    # Check if wrapped as {"message": signed_event}
+                    if 'message' in event_envelope and isinstance(event_envelope['message'], dict):
+                        signed_event = event_envelope['message']
+                    else:
+                        signed_event = event_envelope
+                
+                if not signed_event:
+                    self.logger.warning("No valid signed event in bulk batch item")
+                    continue
+                
+                # Verify signature using the correct SIGNING_KEY from .env
+                if not self.crypto.verify_signed_message(signed_event):
                     self.logger.warning("Invalid signature in bulk batch, skipping event")
                     self.metrics.increment_counter('invalid_signatures')
                     continue
                 
-                event = event_envelope.get('message', {})
+                event = signed_event.get('message', {})
                 event_id = event.get('event_id')
                 
                 if not event_id:
@@ -428,24 +477,13 @@ class EMQXSubscriber:
                     tables[table] = []
                 tables[table].append(item)
             
-            # Bulk insert per table (single transaction)
+            # Bulk insert per table using standardized interface
             for table, items in tables.items():
                 try:
                     self._bulk_insert_transaction(table, items)
                 except Exception as e:
                     self.logger.error(f"Error bulk inserting {table}: {e}")
-                    for item in items:
-                        self._send_acknowledgment(
-                            item['event_id'],
-                            False,
-                            f"DB error: {str(e)}"
-                        )
-                        self.dlq.add_message(
-                            event_id=item['event_id'],
-                            message_type='DATABASE_FAILURE',
-                            payload=item['event'],
-                            error=str(e)
-                        )
+                    # Error handling is now done in _bulk_insert_transaction
             
             self.messages_processed += len(buffer)
             
@@ -463,7 +501,7 @@ class EMQXSubscriber:
     
     def _bulk_insert_transaction(self, table: str, items: List[Dict[str, Any]]):
         """
-        Perform true bulk insert in single transaction
+        Perform true bulk insert using standardized interface
         Only sends ACKs after successful commit
         """
         if not items:
@@ -473,15 +511,8 @@ class EMQXSubscriber:
         event_ids = [item['event_id'] for item in items]
         
         try:
-            # Begin transaction
-            if hasattr(self.target_db.connection, 'begin'):
-                self.target_db.connection.begin()
-            
-            # Prepare bulk data
-            insert_data = []
-            update_data = []
-            delete_data = []
-            
+            # Prepare operations for batch execution
+            operations = []
             for item in items:
                 event = item['event']
                 data = event.get('data', {}).copy()
@@ -491,142 +522,57 @@ class EMQXSubscriber:
                 data['cdc_operation'] = operation
                 data['synced_at'] = time.time()
                 
-                if operation in ['INSERT', 'READ']:
-                    if 'id' in data:
-                        del data['id']
-                    insert_data.append(data)
-                elif operation == 'UPDATE':
-                    update_data.append((data, item['event_id']))
-                elif operation == 'DELETE':
-                    delete_data.append(item['event_id'])
+                operations.append({
+                    'table': table,
+                    'operation': operation,
+                    'data': data,
+                    'event_id': item['event_id']
+                })
             
-            # Execute bulk operations
-            if insert_data:
-                self._bulk_insert_records(table, insert_data)
+            # Execute batch using standardized interface
+            success = self.target_db.execute_batch(operations)
             
-            if update_data:
-                self._bulk_update_records(table, update_data)
-            
-            if delete_data:
-                self._bulk_delete_records(table, delete_data)
-            
-            # COMMIT TRANSACTION
-            self.target_db.connection.commit()
-            
-            # ONLY AFTER COMMIT: Send ACKs
-            for event_id in event_ids:
-                self._send_acknowledgment(event_id, True)
-                self._mark_processed(event_id)
-            
-            duration = time.time() - start_time
-            self.metrics.record_latency('bulk_insert', duration)
-            self.metrics.increment_counter('bulk_inserts')
-            
-            self.logger.debug(
-                f"Bulk inserted {len(items)} events into {table} "
-                f"({duration*1000:.2f}ms)"
-            )
+            if success:
+                # ONLY AFTER SUCCESS: Send ACKs
+                for event_id in event_ids:
+                    self._send_acknowledgment(event_id, True)
+                    self._mark_processed(event_id)
+                
+                duration = time.time() - start_time
+                self.metrics.record_latency('bulk_insert', duration)
+                self.metrics.increment_counter('bulk_inserts')
+                
+                self.logger.debug(
+                    f"Bulk inserted {len(items)} events into {table} "
+                    f"({duration*1000:.2f}ms)"
+                )
+            else:
+                raise Exception("Batch execution returned False")
             
         except Exception as e:
-            # ROLLBACK on error
-            try:
-                self.target_db.connection.rollback()
-            except Exception:
-                pass
-            
             self.logger.error(
-                f"Bulk insert failed, transaction rolled back: {e}",
+                f"Bulk insert failed: {e}",
                 exc_info=True
             )
+            
+            # Send individual NACKs and add to DLQ
+            for item in items:
+                self._send_acknowledgment(
+                    item['event_id'],
+                    False,
+                    f"DB error: {str(e)}"
+                )
+                try:
+                    self.dlq.add_message(
+                        event_id=item['event_id'],
+                        message_type='DATABASE_FAILURE',
+                        payload=item['event'],
+                        error=str(e)
+                    )
+                except Exception as dlq_error:
+                    self.logger.error(f"DLQ operation failed: {dlq_error}")
+            
             raise
-    
-    def _bulk_insert_records(self, table: str, data_list: List[Dict[str, Any]]):
-        """Bulk insert using database-specific method"""
-        if not data_list:
-            return
-        
-        db_type = self.target_db_config['type']
-        
-        if db_type == 'postgresql':
-            self._bulk_insert_postgresql(table, data_list)
-        elif db_type == 'mysql':
-            self._bulk_insert_mysql(table, data_list)
-        elif db_type == 'mongodb':
-            self._bulk_insert_mongodb(table, data_list)
-    
-    def _bulk_insert_postgresql(self, table: str, data_list: List[Dict[str, Any]]):
-        """PostgreSQL bulk insert using execute_values"""
-        try:
-            import psycopg2.extras
-            
-            if not data_list:
-                return
-            
-            columns = list(data_list[0].keys())
-            values = [tuple(row[col] for col in columns) for row in data_list]
-            
-            query = f"INSERT INTO {table} ({', '.join(columns)}) VALUES %s"
-            
-            cursor = self.target_db.connection.cursor()
-            psycopg2.extras.execute_values(
-                cursor,
-                query,
-                values,
-                page_size=len(values)
-            )
-            
-        except Exception as e:
-            self.logger.error(f"PostgreSQL bulk insert error: {e}")
-            raise
-    
-    def _bulk_insert_mysql(self, table: str, data_list: List[Dict[str, Any]]):
-        """MySQL bulk insert"""
-        try:
-            if not data_list:
-                return
-            
-            columns = list(data_list[0].keys())
-            placeholders = ', '.join(['%s'] * len(columns))
-            values_list = [tuple(row[col] for col in columns) for row in data_list]
-            
-            query = f"""
-                INSERT INTO {table} ({', '.join(columns)})
-                VALUES ({placeholders})
-            """
-            
-            cursor = self.target_db.connection.cursor()
-            cursor.executemany(query, values_list)
-            
-        except Exception as e:
-            self.logger.error(f"MySQL bulk insert error: {e}")
-            raise
-    
-    def _bulk_insert_mongodb(self, table: str, data_list: List[Dict[str, Any]]):
-        """MongoDB bulk insert using insert_many"""
-        try:
-            if not data_list:
-                return
-            
-            collection = self.target_db.db[table]
-            collection.insert_many(data_list)
-            
-        except Exception as e:
-            self.logger.error(f"MongoDB bulk insert error: {e}")
-            raise
-    
-    def _bulk_update_records(self, table: str, update_data: List[tuple]):
-        """Bulk update records"""
-        for data, event_id in update_data:
-            key_field = 'id'
-            key_value = data.get(key_field)
-            if key_value:
-                update_dict = {k: v for k, v in data.items() if k != key_field}
-                self.target_db.update_record(table, update_dict, key_field, key_value)
-    
-    def _bulk_delete_records(self, table: str, delete_ids: List[str]):
-        """Bulk delete records"""
-        for event_id in delete_ids:
-            self.target_db.delete_record(table, 'id', event_id)
     
     def _send_acknowledgment(self, event_id: str, success: bool, error: str = None):
         """Send ACK back to publisher"""

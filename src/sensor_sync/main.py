@@ -126,12 +126,15 @@ class PublisherApplication:
                 
                 if not success:
                     self.logger.error("Failed to publish event")
-                    self.dlq.add_message(
-                        event_id=processed_event.get('message', {}).get('event_id', 'unknown'),
-                        message_type='PUBLISH_FAILURE',
-                        payload=processed_event,
-                        error="MQTT publish failed"
-                    )
+                    try:
+                        self.dlq.add_message(
+                            event_id=processed_event.get('message', {}).get('event_id', 'unknown'),
+                            message_type='PUBLISH_FAILURE',
+                            payload=processed_event,
+                            error="MQTT publish failed"
+                        )
+                    except Exception as dlq_error:
+                        self.logger.error(f"DLQ operation failed: {dlq_error}")
             
         except Exception as e:
             self.logger.error(f"Error handling change: {e}", exc_info=True)

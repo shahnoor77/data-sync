@@ -1,4 +1,13 @@
 FROM python:3.11-slim
-RUN pip install paho-mqtt
+
+# Install required dependencies for live_test.py
+RUN pip install paho-mqtt cryptography
+
+# Copy the source directory and test file
+COPY src/ ./src/
 COPY live_test.py .
+
+# Set PYTHONPATH to include current directory for imports
+ENV PYTHONPATH=/
+
 CMD ["python", "live_test.py"]

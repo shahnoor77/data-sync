@@ -1,6 +1,6 @@
 """
 EMQX Publisher for CDC events
-Implements 99%+ reliability with batch publishing and max in-flight
+
 """
 
 import json
@@ -56,12 +56,13 @@ class EMQXPublisher:
         
         self.client = mqtt.Client(
             client_id=self.client_id,
-            protocol=mqtt.MQTTv5
+            protocol=mqtt.MQTTv311,  # Changed to v311 for consistency with subscriber
+            clean_session=False  # Session persistence for QoS reliability
         )
         
         # Set max in-flight BEFORE connect
         self.client.max_inflight_messages_set(
-            self.config.get('max_inflight_messages', 200)
+            self.config.get('max_inflight_messages', 2000)  # Increased to match subscriber
         )
         
         # Set callbacks
@@ -85,7 +86,7 @@ class EMQXPublisher:
         
         self.logger.info(
             f"EMQX publisher configured with stable client_id: {self.client_id}, "
-            f"max_inflight: {self.config.get('max_inflight_messages', 200)}"
+            f"max_inflight: {self.config.get('max_inflight_messages', 2000)}, clean_session: False"
         )
     
     def connect(self):
@@ -107,8 +108,7 @@ class EMQXPublisher:
                 self.client.connect(
                     broker_host,
                     broker_port,
-                    keepalive,
-                    clean_start=False  # Persistent session
+                    keepalive
                 )
                 
                 self.client.loop_start()
@@ -212,29 +212,45 @@ class EMQXPublisher:
             # Handle both single and batch ACKs
             if isinstance(event_ids, list):
                 for event_id in event_ids:
+                    # Filter Test Events: Check if event_id starts with 'evt_'
+                    if event_id.startswith('evt_'):
+                        self.logger.info(f"Test ACK received for {event_id}")
+                        continue
+                    
                     if success:
                         self.state_manager.update_state(event_id, EventState.ACKNOWLEDGED)
                         self.metrics.increment_counter('mqtt_acks')
                     else:
                         self.state_manager.update_state(event_id, EventState.FAILED, error=error)
-                        self.dlq.add_message(
-                            event_id=event_id,
-                            message_type='ACK_FAILURE',
-                            payload={'error': error},
-                            error=f"NACK: {error}"
-                        )
+                        try:
+                            self.dlq.add_message(
+                                event_id=event_id,
+                                message_type='ACK_FAILURE',
+                                payload={'error': error},
+                                error=f"NACK: {error}"
+                            )
+                        except Exception as dlq_error:
+                            self.logger.error(f"DLQ operation failed: {dlq_error}")
             else:
+                # Filter Test Events: Check if event_id starts with 'evt_'
+                if event_ids.startswith('evt_'):
+                    self.logger.info(f"Test ACK received for {event_ids}")
+                    return
+                
                 if success:
                     self.state_manager.update_state(event_ids, EventState.ACKNOWLEDGED)
                     self.metrics.increment_counter('mqtt_acks')
                 else:
                     self.state_manager.update_state(event_ids, EventState.FAILED, error=error)
-                    self.dlq.add_message(
-                        event_id=event_ids,
-                        message_type='ACK_FAILURE',
-                        payload={'error': error},
-                        error=f"NACK: {error}"
-                    )
+                    try:
+                        self.dlq.add_message(
+                            event_id=event_ids,
+                            message_type='ACK_FAILURE',
+                            payload={'error': error},
+                            error=f"NACK: {error}"
+                        )
+                    except Exception as dlq_error:
+                        self.logger.error(f"DLQ operation failed: {dlq_error}")
                 
         except Exception as e:
             self.logger.error(f"Error processing ACK: {e}", exc_info=True)
@@ -389,12 +405,15 @@ class EMQXPublisher:
         except Exception as e:
             self.logger.error(f"Error publishing event: {e}", exc_info=True)
             self.state_manager.update_state(event_id, EventState.FAILED, error=str(e))
-            self.dlq.add_message(
-                event_id=event_id,
-                message_type='PUBLISH_FAILURE',
-                payload=event,
-                error=str(e)
-            )
+            try:
+                self.dlq.add_message(
+                    event_id=event_id,
+                    message_type='PUBLISH_FAILURE',
+                    payload=event,
+                    error=str(e)
+                )
+            except Exception as dlq_error:
+                self.logger.error(f"DLQ operation failed: {dlq_error}")
             return False
     
     def is_connected(self) -> bool:

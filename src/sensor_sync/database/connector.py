@@ -14,6 +14,12 @@ from abc import ABC, abstractmethod
 class DatabaseConnector(ABC):
     """Abstract base class for database connectors"""
     
+    @property
+    @abstractmethod
+    def connection(self):
+        """Abstract property for database connection handle"""
+        pass
+    
     @abstractmethod
     def connect(self):
         """Establish database connection"""
@@ -22,6 +28,21 @@ class DatabaseConnector(ABC):
     @abstractmethod
     def disconnect(self):
         """Close database connection"""
+        pass
+    
+    @abstractmethod
+    def is_connected(self) -> bool:
+        """Check if database is connected"""
+        pass
+    
+    @abstractmethod
+    def execute_batch(self, operations: List[Dict[str, Any]]) -> bool:
+        """Execute batch operations for high-throughput inserts"""
+        pass
+    
+    @abstractmethod
+    def insert_event(self, table: str, event: Dict[str, Any]) -> Any:
+        """Insert a single event (standardized method)"""
         pass
     
     @abstractmethod
@@ -66,28 +87,93 @@ class PostgreSQLConnector(DatabaseConnector):
             config: Database configuration dict
         """
         self.config = config
-        self.connection = None
+        self._connection = None
+    
+    @property
+    def connection(self):
+        """Standardized connection handle"""
+        return self._connection
     
     def connect(self):
         """Establish PostgreSQL connection"""
-        self.connection = psycopg2.connect(
+        self._connection = psycopg2.connect(
             host=self.config['host'],
             port=self.config['port'],
             database=self.config['database'],
             user=self.config['user'],
             password=self.config['password']
         )
-        self.connection.autocommit = False
+        self._connection.autocommit = False
     
     def disconnect(self):
         """Close PostgreSQL connection"""
-        if self.connection:
-            self.connection.close()
-            self.connection = None
+        if self._connection:
+            self._connection.close()
+            self._connection = None
+    
+    def is_connected(self) -> bool:
+        """Check if PostgreSQL is connected"""
+        try:
+            return self._connection is not None and self._connection.closed == 0
+        except Exception:
+            return False
+    
+    def execute_batch(self, operations: List[Dict[str, Any]]) -> bool:
+        """Execute batch operations for high-throughput inserts"""
+        try:
+            cursor = self._connection.cursor()
+            
+            # Group operations by table and type
+            tables = {}
+            for op in operations:
+                table = op.get('table')
+                if table not in tables:
+                    tables[table] = {'inserts': [], 'updates': [], 'deletes': []}
+                
+                op_type = op.get('operation', 'INSERT')
+                if op_type in ['INSERT', 'READ']:
+                    tables[table]['inserts'].append(op.get('data', {}))
+                elif op_type == 'UPDATE':
+                    tables[table]['updates'].append(op)
+                elif op_type == 'DELETE':
+                    tables[table]['deletes'].append(op)
+            
+            # Execute batch inserts using execute_values
+            for table, ops in tables.items():
+                if ops['inserts']:
+                    self._batch_insert_postgresql(cursor, table, ops['inserts'])
+                if ops['updates']:
+                    for update_op in ops['updates']:
+                        self.update_record(table, update_op['data'], 'id', update_op.get('id'))
+                if ops['deletes']:
+                    for delete_op in ops['deletes']:
+                        self.delete_record(table, 'id', delete_op.get('id'))
+            
+            self._connection.commit()
+            return True
+            
+        except Exception as e:
+            self._connection.rollback()
+            raise Exception(f"PostgreSQL batch operation failed: {e}")
+    
+    def _batch_insert_postgresql(self, cursor, table: str, data_list: List[Dict[str, Any]]):
+        """PostgreSQL-specific batch insert using execute_values"""
+        if not data_list:
+            return
+        
+        columns = list(data_list[0].keys())
+        values = [tuple(row[col] for col in columns) for row in data_list]
+        
+        query = f"INSERT INTO {table} ({', '.join(columns)}) VALUES %s"
+        psycopg2.extras.execute_values(cursor, query, values, page_size=len(values))
+    
+    def insert_event(self, table: str, event: Dict[str, Any]) -> Any:
+        """Insert a single event (standardized method)"""
+        return self.insert_record(table, event)
     
     def execute_query(self, query: str, params: Optional[tuple] = None):
         """Execute a PostgreSQL query"""
-        cursor = self.connection.cursor()
+        cursor = self._connection.cursor()
         cursor.execute(query, params)
         return cursor
     
@@ -109,10 +195,10 @@ class PostgreSQLConnector(DatabaseConnector):
             RETURNING id
         """
         
-        cursor = self.connection.cursor()
+        cursor = self._connection.cursor()
         cursor.execute(query, values)
         record_id = cursor.fetchone()[0]
-        self.connection.commit()
+        self._connection.commit()
         
         return record_id
     
@@ -128,17 +214,17 @@ class PostgreSQLConnector(DatabaseConnector):
             WHERE {key_field} = %s
         """
         
-        cursor = self.connection.cursor()
+        cursor = self._connection.cursor()
         cursor.execute(query, values)
-        self.connection.commit()
+        self._connection.commit()
     
     def delete_record(self, table: str, key_field: str, key_value: Any):
         """Delete record from PostgreSQL table"""
         query = f"DELETE FROM {table} WHERE {key_field} = %s"
         
-        cursor = self.connection.cursor()
+        cursor = self._connection.cursor()
         cursor.execute(query, (key_value,))
-        self.connection.commit()
+        self._connection.commit()
     
     def table_exists(self, table: str) -> bool:
         """Check if table exists in PostgreSQL"""
@@ -158,7 +244,7 @@ class PostgreSQLConnector(DatabaseConnector):
             )
         """
         
-        cursor = self.connection.cursor()
+        cursor = self._connection.cursor()
         cursor.execute(query, (schema, table_name))
         return cursor.fetchone()[0]
     
@@ -184,7 +270,7 @@ class PostgreSQLConnector(DatabaseConnector):
             ORDER BY ordinal_position
         """
         
-        cursor = self.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cursor = self._connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cursor.execute(query, (schema, table_name))
         return cursor.fetchall()
 
@@ -195,28 +281,94 @@ class MySQLConnector(DatabaseConnector):
     def __init__(self, config: Dict[str, Any]):
         """Initialize MySQL connector"""
         self.config = config
-        self.connection = None
+        self._connection = None
+    
+    @property
+    def connection(self):
+        """Standardized connection handle"""
+        return self._connection
     
     def connect(self):
         """Establish MySQL connection"""
-        self.connection = mysql.connector.connect(
+        self._connection = mysql.connector.connect(
             host=self.config['host'],
             port=self.config['port'],
             database=self.config['database'],
             user=self.config['user'],
             password=self.config['password']
         )
-        self.connection.autocommit = False
+        self._connection.autocommit = False
     
     def disconnect(self):
         """Close MySQL connection"""
-        if self.connection:
-            self.connection.close()
-            self.connection = None
+        if self._connection:
+            self._connection.close()
+            self._connection = None
+    
+    def is_connected(self) -> bool:
+        """Check if MySQL is connected"""
+        try:
+            return self._connection is not None and self._connection.is_connected()
+        except Exception:
+            return False
+    
+    def execute_batch(self, operations: List[Dict[str, Any]]) -> bool:
+        """Execute batch operations for high-throughput inserts"""
+        try:
+            cursor = self._connection.cursor()
+            
+            # Group operations by table and type
+            tables = {}
+            for op in operations:
+                table = op.get('table')
+                if table not in tables:
+                    tables[table] = {'inserts': [], 'updates': [], 'deletes': []}
+                
+                op_type = op.get('operation', 'INSERT')
+                if op_type in ['INSERT', 'READ']:
+                    tables[table]['inserts'].append(op.get('data', {}))
+                elif op_type == 'UPDATE':
+                    tables[table]['updates'].append(op)
+                elif op_type == 'DELETE':
+                    tables[table]['deletes'].append(op)
+            
+            # Execute batch operations
+            for table, ops in tables.items():
+                if ops['inserts']:
+                    self._batch_insert_mysql(cursor, table, ops['inserts'])
+                if ops['updates']:
+                    for update_op in ops['updates']:
+                        self.update_record(table, update_op['data'], 'id', update_op.get('id'))
+                if ops['deletes']:
+                    for delete_op in ops['deletes']:
+                        self.delete_record(table, 'id', delete_op.get('id'))
+            
+            self._connection.commit()
+            return True
+            
+        except Exception as e:
+            self._connection.rollback()
+            raise Exception(f"MySQL batch operation failed: {e}")
+    
+    def _batch_insert_mysql(self, cursor, table: str, data_list: List[Dict[str, Any]]):
+        """MySQL-specific batch insert using executemany"""
+        if not data_list:
+            return
+        
+        columns = list(data_list[0].keys())
+        placeholders = ', '.join(['%s'] * len(columns))
+        values_list = [tuple(row[col] for col in columns) for row in data_list]
+        
+        query = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})"
+        cursor.executemany(query, values_list)
+    
+    def insert_event(self, table: str, event: Dict[str, Any]) -> Any:
+        """Insert a single event (standardized method)"""
+        return self.insert_record(table, event)
     
     def execute_query(self, query: str, params: Optional[tuple] = None):
         """Execute a MySQL query"""
-        cursor = self.connection.cursor()
+        cursor = self._connection.cursor()
         cursor.execute(query, params)
         return cursor
     
@@ -231,10 +383,10 @@ class MySQLConnector(DatabaseConnector):
             VALUES ({', '.join(placeholders)})
         """
         
-        cursor = self.connection.cursor()
+        cursor = self._connection.cursor()
         cursor.execute(query, values)
         record_id = cursor.lastrowid
-        self.connection.commit()
+        self._connection.commit()
         
         return record_id
     
@@ -249,17 +401,17 @@ class MySQLConnector(DatabaseConnector):
             WHERE {key_field} = %s
         """
         
-        cursor = self.connection.cursor()
+        cursor = self._connection.cursor()
         cursor.execute(query, values)
-        self.connection.commit()
+        self._connection.commit()
     
     def delete_record(self, table: str, key_field: str, key_value: Any):
         """Delete record from MySQL table"""
         query = f"DELETE FROM {table} WHERE {key_field} = %s"
         
-        cursor = self.connection.cursor()
+        cursor = self._connection.cursor()
         cursor.execute(query, (key_value,))
-        self.connection.commit()
+        self._connection.commit()
     
     def table_exists(self, table: str) -> bool:
         """Check if table exists in MySQL"""
@@ -270,7 +422,7 @@ class MySQLConnector(DatabaseConnector):
             AND table_name = %s
         """
         
-        cursor = self.connection.cursor()
+        cursor = self._connection.cursor()
         cursor.execute(query, (self.config['database'], table))
         count = cursor.fetchone()[0]
         return count > 0
@@ -289,7 +441,7 @@ class MySQLConnector(DatabaseConnector):
             ORDER BY ordinal_position
         """
         
-        cursor = self.connection.cursor(dictionary=True)
+        cursor = self._connection.cursor(dictionary=True)
         cursor.execute(query, (self.config['database'], table))
         return cursor.fetchall()
 
@@ -300,21 +452,79 @@ class MongoDBConnector(DatabaseConnector):
     def __init__(self, config: Dict[str, Any]):
         """Initialize MongoDB connector"""
         self.config = config
-        self.client = None
-        self.db = None
+        self._client = None
+        self._db = None
+    
+    @property
+    def connection(self):
+        """Standardized connection handle - returns the database object"""
+        return self._db
     
     def connect(self):
         """Establish MongoDB connection"""
         connection_string = f"mongodb://{self.config['user']}:{self.config['password']}@{self.config['host']}:{self.config['port']}"
-        self.client = MongoClient(connection_string)
-        self.db = self.client[self.config['database']]
+        self._client = MongoClient(connection_string)
+        self._db = self._client[self.config['database']]
     
     def disconnect(self):
         """Close MongoDB connection"""
-        if self.client:
-            self.client.close()
-            self.client = None
-            self.db = None
+        if self._client:
+            self._client.close()
+            self._client = None
+            self._db = None
+    
+    def is_connected(self) -> bool:
+        """Check if MongoDB is connected"""
+        try:
+            if self._client is None or self._db is None:
+                return False
+            # Ping the database to check connection
+            self._client.admin.command('ping')
+            return True
+        except Exception:
+            return False
+    
+    def execute_batch(self, operations: List[Dict[str, Any]]) -> bool:
+        """Execute batch operations for high-throughput inserts"""
+        try:
+            # Group operations by table and type
+            tables = {}
+            for op in operations:
+                table = op.get('table')
+                if table not in tables:
+                    tables[table] = {'inserts': [], 'updates': [], 'deletes': []}
+                
+                op_type = op.get('operation', 'INSERT')
+                if op_type in ['INSERT', 'READ']:
+                    tables[table]['inserts'].append(op.get('data', {}))
+                elif op_type == 'UPDATE':
+                    tables[table]['updates'].append(op)
+                elif op_type == 'DELETE':
+                    tables[table]['deletes'].append(op)
+            
+            # Execute batch operations
+            for table, ops in tables.items():
+                collection = self._db[table]
+                
+                if ops['inserts']:
+                    collection.insert_many(ops['inserts'])
+                
+                if ops['updates']:
+                    for update_op in ops['updates']:
+                        self.update_record(table, update_op['data'], 'id', update_op.get('id'))
+                
+                if ops['deletes']:
+                    for delete_op in ops['deletes']:
+                        self.delete_record(table, 'id', delete_op.get('id'))
+            
+            return True
+            
+        except Exception as e:
+            raise Exception(f"MongoDB batch operation failed: {e}")
+    
+    def insert_event(self, table: str, event: Dict[str, Any]) -> Any:
+        """Insert a single event (standardized method)"""
+        return self.insert_record(table, event)
     
     def execute_query(self, query: str, params: Optional[tuple] = None):
         """Execute a MongoDB query (not directly applicable)"""
@@ -331,13 +541,13 @@ class MongoDBConnector(DatabaseConnector):
         Returns:
             Inserted document ID
         """
-        collection = self.db[table]
+        collection = self._db[table]
         result = collection.insert_one(data)
         return result.inserted_id
     
     def update_record(self, table: str, data: Dict[str, Any], key_field: str, key_value: Any):
         """Update record in MongoDB collection"""
-        collection = self.db[table]
+        collection = self._db[table]
         collection.update_one(
             {key_field: key_value},
             {'$set': data}
@@ -345,19 +555,19 @@ class MongoDBConnector(DatabaseConnector):
     
     def delete_record(self, table: str, key_field: str, key_value: Any):
         """Delete record from MongoDB collection"""
-        collection = self.db[table]
+        collection = self._db[table]
         collection.delete_one({key_field: key_value})
     
     def table_exists(self, table: str) -> bool:
         """Check if collection exists in MongoDB"""
-        return table in self.db.list_collection_names()
+        return table in self._db.list_collection_names()
     
     def get_table_schema(self, table: str) -> List[Dict[str, Any]]:
         """
         Get collection schema from MongoDB
         Note: MongoDB is schemaless, so we infer from a sample document
         """
-        collection = self.db[table]
+        collection = self._db[table]
         sample = collection.find_one()
         
         if not sample:
