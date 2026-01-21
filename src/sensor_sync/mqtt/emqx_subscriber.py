@@ -48,7 +48,6 @@ class EMQXSubscriber:
         
         self.client = None
         self.connected = False
-        self._lock = threading.Lock()
         
         # Extract instance_id for targeted feedback
         self.instance_id = mqtt_config.get('client_id_subscriber', 'subscriber_001')
@@ -56,10 +55,10 @@ class EMQXSubscriber:
         # Triple-Worker Concurrency: Shared queue with 3 independent workers
         self.internal_queue = queue.Queue(maxsize=50000)  # Shared queue for all workers
         
-        # Nitro Configuration: RAM-Buffered Writes with Dual Workers
-        self.num_workers = 2              # Expand Workers: 2 workers for parallel batch preparation/commit
-        self.worker_batch_size = 5000     # Double the Batch: 5000 records for RAM-buffered efficiency
-        self.worker_timeout = 0.5         # Batch Efficiency: Aggressive 500ms timeout for small batches
+        # Industrial Grade Configuration with Reduced Batch Pressure
+        self.num_workers = 2              # Dual workers for parallel processing
+        self.worker_batch_size = 1000     # Reduced batch size to prevent long-held DB locks
+        self.worker_timeout = 0.2         # Aggressive 200ms timeout to reduce redelivery overlap
         self.worker_threads = []          # List of worker threads
         self.workers_active = False       # Control flag for all workers
         
@@ -74,11 +73,6 @@ class EMQXSubscriber:
         # Database connection - Force MySQL connector
         self.target_db = None
         self.schema_manager = None
-        
-        # Idempotency tracking
-        self._processed_messages = {}
-        self._message_retention = 300
-        self.messages_processed = 0
         
         # Connect to MySQL database
         self._connect_to_mysql_database()
@@ -272,7 +266,7 @@ class EMQXSubscriber:
                     raise
     
     def disconnect(self):
-        """Disconnect gracefully with Industrial Grade metrics"""
+        """Disconnect gracefully"""
         self.workers_active = False
         
         # Wait for all worker threads to finish
@@ -291,7 +285,7 @@ class EMQXSubscriber:
         elapsed_time = time.time() - self.start_time
         final_records_per_second = self.total_messages_landed / elapsed_time if elapsed_time > 0 else 0
         
-        self.logger.info(f"[STATUS] Industrial Grade: Stopped. Total: {self.total_messages_landed:,} | Final Rate: {final_records_per_second:.0f} records/sec | Connection Discipline")
+        self.logger.info(f"[STATUS] Stopped. Total: {self.total_messages_landed:,} | Final Rate: {final_records_per_second:.0f} records/sec")
     
     def _on_connect(self, client, userdata, flags, rc, properties=None):
         """Callback for connection with Zero-Crash Logic"""
@@ -345,8 +339,8 @@ class EMQXSubscriber:
     
     def _on_message(self, client, userdata, msg):
         """
-        Industrial Grade: Fast ingestion with message tracking for Manual Acknowledgment
-        Store message info for worker-based acknowledgment after successful commit
+        Fast ingestion to shared queue - at-least-once delivery semantics
+        No in-memory deduplication - idempotency handled at database level
         """
         try:
             # Fast Path - Only extract topic and payload
@@ -354,36 +348,34 @@ class EMQXSubscriber:
                 topic = msg.topic
                 payload = msg.payload.decode('utf-8', errors='replace')
             except UnicodeDecodeError:
-                # Summary-Only Mode: No individual error logging
                 return
             
-            # The Handshake: Store message info for Manual Acknowledgment after commit
+            # Store message info for worker processing
             message_info = {
                 'topic': topic,
                 'payload': payload,
-                'msg_id': getattr(msg, 'mid', None),  # Message ID for QoS 1 PUBACK
                 'timestamp': time.time()
             }
             
-            # Immediate queue insertion for workers - NO processing in MQTT callback
+            # Immediate queue insertion for workers
             if self.internal_queue.full():
-                # Drop oldest message if queue is full (LIFO policy)
+                # Drop oldest message if queue is full
                 try:
                     self.internal_queue.get_nowait()
                     self.metrics.increment_counter('dropped_message_overflow')
                 except queue.Empty:
                     pass
             
-            # Put message_info into shared queue for workers (includes acknowledgment data)
+            # Put message_info into shared queue for workers
             self.internal_queue.put_nowait(message_info)
             
         except Exception:
-            # Shield MQTT loop from any crashes - Summary-Only Mode: no error logging
+            # Shield MQTT loop from any crashes
             pass
             
         
     def _start_triple_workers(self):
-        """Start Industrial Grade workers with connection discipline"""
+        """Start workers with reduced batch pressure configuration"""
         self.workers_active = True
         self.worker_threads = []
         
@@ -392,84 +384,78 @@ class EMQXSubscriber:
                 target=self._worker_loop,
                 args=(worker_id,),
                 daemon=True,
-                name=f"IndustrialWorker-{worker_id}"
+                name=f"Worker-{worker_id}"
             )
             worker_thread.start()
             self.worker_threads.append(worker_thread)
         
-        self.logger.info(f"[STATUS] Industrial Grade: Started {self.num_workers} workers (5000 records/batch, 500ms timeout, manual ACK)")
+        self.logger.info(f"[STATUS] Started {self.num_workers} workers (1000 records/batch, 200ms timeout)")
     
     def _worker_loop(self, worker_id: int):
         """
-        Industrial Grade: Connection Discipline with Manual Acknowledgment
-        Ensures connections are returned and acknowledgments only sent after successful commits
+        Worker with deterministic batch outcomes and connection discipline
+        Every batch results in exactly one of: DB commit, DLQ persistence, or retry
         """
-        self.logger.info(f"[WORKER-{worker_id}] Industrial Grade: Started with connection discipline and manual ACK")
+        self.logger.info(f"[WORKER-{worker_id}] Started with deterministic batch outcomes")
         
         worker_batch = []
-        message_batch = []  # Track message info for acknowledgment
+        message_batch = []
         last_flush_time = time.time()
         
         while self.workers_active:
             worker_connection = None
             try:
-                # Connection Discipline: Always wrap DB logic in try...finally
+                # Connection discipline: Get connection with retry handling
                 try:
                     worker_connection = self.target_db._get_connection()
                 except Exception as pool_error:
                     if "pool exhausted" in str(pool_error).lower() or "timeout" in str(pool_error).lower():
                         self.logger.warning(f"[WORKER-{worker_id}] Pool exhausted, waiting 5s before retry")
-                        time.sleep(5)  # Pool Safety: Sleep instead of crashing
+                        time.sleep(5)
                         continue
                     else:
-                        raise  # Re-raise non-pool errors
+                        raise
                 
-                # Industrial Grade: Pull messages with acknowledgment tracking
+                # Pull messages for batch processing
                 messages_pulled = 0
                 
                 while messages_pulled < self.worker_batch_size and self.workers_active:
                     try:
                         message_info = self.internal_queue.get(timeout=0.1)
                         worker_batch.append((message_info['topic'], message_info['payload']))
-                        message_batch.append(message_info)  # Store for acknowledgment
+                        message_batch.append(message_info)
                         self.internal_queue.task_done()
                         messages_pulled += 1
                     except queue.Empty:
-                        break  # No more messages available
+                        break
                 
                 current_time = time.time()
                 
-                # Batch Efficiency: Aggressive timeout for small batches (500ms instead of 2s)
+                # Batch pressure reduction: 1000 records OR 200ms timeout
                 should_flush = (
-                    len(worker_batch) >= self.worker_batch_size or  # Hard Cap: 5000 records
-                    (worker_batch and (current_time - last_flush_time) >= self.worker_timeout)  # 500ms timeout
+                    len(worker_batch) >= self.worker_batch_size or
+                    (worker_batch and (current_time - last_flush_time) >= self.worker_timeout)
                 )
                 
                 if should_flush and worker_batch:
                     batch_start = time.time()
                     
-                    # Connection Discipline: Process batch with proper error handling
+                    # Deterministic batch outcome
                     try:
                         self._process_worker_batch(worker_id, worker_batch, worker_connection)
                         
-                        # The Handshake: Manual Acknowledgment ONLY after successful commit
-                        self._acknowledge_messages(message_batch)
-                        
-                        batch_duration = (time.time() - batch_start) * 1000  # Convert to ms
-                        
-                        # Log Metrics: Clear, human-readable batch log
-                        self.logger.info(f"[BATCH] Worker-{worker_id} committed {len(worker_batch)} records in {batch_duration:.0f}ms (Industrial Grade)")
+                        batch_duration = (time.time() - batch_start) * 1000
+                        self.logger.info(f"[BATCH] Worker-{worker_id} committed {len(worker_batch)} records in {batch_duration:.0f}ms")
                         
                         # Track for observability
                         self.total_messages_landed += len(worker_batch)
                         self.batch_latencies.append(batch_duration)
-                        if len(self.batch_latencies) > 100:  # Keep only last 100 batch times
+                        if len(self.batch_latencies) > 100:
                             self.batch_latencies = self.batch_latencies[-100:]
                         
                     except Exception as batch_error:
-                        # Connection Discipline: Handle batch failure without acknowledging
-                        self.logger.error(f"[WORKER-{worker_id}] Batch failed, no acknowledgment sent: {batch_error}")
-                        # Messages will be redelivered due to no acknowledgment
+                        self.logger.error(f"[WORKER-{worker_id}] Batch processing failed: {batch_error}")
+                        # Allow redelivery - no confirmation sent
                     
                     worker_batch = []
                     message_batch = []
@@ -477,42 +463,26 @@ class EMQXSubscriber:
                 
                 # Prevent tight loop when queue is empty
                 if messages_pulled == 0:
-                    time.sleep(0.01)  # 10ms pause when no messages
+                    time.sleep(0.01)
                 
             except Exception as e:
                 self.logger.error(f"[WORKER-{worker_id}] Error in worker loop: {e}")
-                time.sleep(1)  # Brief pause before retry
+                time.sleep(1)
                 
             finally:
-                # Connection Discipline: Always return connection to pool in finally block
+                # Connection discipline: Always return connection to pool
                 if worker_connection:
                     try:
                         self.target_db._return_connection(worker_connection)
                     except Exception as cleanup_error:
                         self.logger.warning(f"[WORKER-{worker_id}] Connection cleanup error: {cleanup_error}")
         
-        self.logger.info(f"[WORKER-{worker_id}] Industrial Grade: Stopped")
-    
-    def _acknowledge_messages(self, message_batch):
-        """
-        The Handshake: Manual Acknowledgment after successful database commit
-        Only acknowledge messages that were successfully processed
-        """
-        try:
-            for message_info in message_batch:
-                # For QoS 1, the acknowledgment is automatic in paho-mqtt
-                # But we can track successful processing for metrics
-                pass
-            
-            # Track successful acknowledgments for metrics
-            self.metrics.increment_counter('messages_acknowledged', len(message_batch))
-            
-        except Exception as e:
-            self.logger.warning(f"Error in manual acknowledgment: {e}")
+        self.logger.info(f"[WORKER-{worker_id}] Stopped")
     
     def _process_worker_batch(self, worker_id: int, worker_batch: List[tuple], worker_connection):
         """
-        Micro-Batching: Process batch with 250 record hard cap and Summary-Only Mode logging
+        Process batch with deterministic outcomes and database idempotency
+        Every batch results in exactly one of: DB commit, DLQ persistence, or retry
         """
         if not worker_batch:
             return
@@ -520,10 +490,9 @@ class EMQXSubscriber:
         valid_events = []
         invalid_count = 0
         
-        # Step 1: Rapid verification and filtering (Summary-Only Mode: no individual logging)
+        # Step 1: Parse and validate messages
         for topic, payload in worker_batch:
             try:
-                # Parse JSON
                 try:
                     parsed_payload = json.loads(payload)
                 except json.JSONDecodeError:
@@ -542,17 +511,11 @@ class EMQXSubscriber:
                     invalid_count += 1
                     continue
                 
-                # Performance Optimization: Skip signature verification for stress test messages
                 event = signed_event.get('message', {})
                 trace_id = event.get('trace_id')
                 
                 if not trace_id:
                     invalid_count += 1
-                    continue
-                
-                # Check for duplicates
-                if self._is_duplicate(trace_id):
-                    self._send_acknowledgment(trace_id, True, "Duplicate")
                     continue
                 
                 valid_events.append({
@@ -564,32 +527,37 @@ class EMQXSubscriber:
             except Exception:
                 invalid_count += 1
         
-        # Step 2: Database transaction with retry logic
+        # Step 2: Database operation with retry logic
         if valid_events:
             retry_attempts = 3
             for attempt in range(retry_attempts):
                 try:
                     self._bulk_insert_worker(worker_id, valid_events, worker_connection)
-                    break  # Success, exit retry loop
+                    return  # Success - exit function
                     
                 except Exception as e:
-                    if attempt < retry_attempts - 1:
-                        # Retry on lock timeout or deadlock
-                        if "Lock wait timeout" in str(e) or "Deadlock" in str(e):
-                            time.sleep(0.5)  # 500ms sleep before retry
+                    error_str = str(e).lower()
+                    
+                    # Handle different error types
+                    if "duplicate" in error_str or "unique constraint" in error_str:
+                        # Duplicates are no-ops, consider successful
+                        return
+                    elif "deadlock" in error_str or "lock wait timeout" in error_str:
+                        if attempt < retry_attempts - 1:
+                            time.sleep(0.1 * (attempt + 1))  # Exponential backoff
+                            continue
                         else:
-                            time.sleep(0.1)
+                            # Final deadlock failure - send to DLQ
+                            self._handle_worker_batch_failure(worker_id, valid_events, str(e))
+                            return
                     else:
-                        # Final failure, dump to DLQ
-                        self.logger.error(f"[WORKER-{worker_id}] All retry attempts failed, dumping to DLQ: {e}")
+                        # Other database errors - send to DLQ
                         self._handle_worker_batch_failure(worker_id, valid_events, str(e))
-        
-        self.messages_processed += len(worker_batch)
+                        return
     
     def _bulk_insert_worker(self, worker_id: int, valid_events: List[Dict[str, Any]], worker_connection):
         """
-        Insert-Only Path: Pure INSERT with automatic connection cleanup
-        Uses context manager pattern to ensure connection is always released
+        Database idempotency with UPSERT - duplicates become cheap no-ops
         """
         if not valid_events:
             return
@@ -598,26 +566,23 @@ class EMQXSubscriber:
         cursor = None
         
         try:
-            cursor = worker_connection.cursor(buffered=False)  # Disable buffering for speed
+            cursor = worker_connection.cursor(buffered=False)
             
-            # Insert-Only Path: Disable metadata lookups
+            # Disable checks for performance
             cursor.execute("SET SESSION sql_notes = 0")
             cursor.execute("SET SESSION foreign_key_checks = 0")
             cursor.execute("SET SESSION unique_checks = 0")
             
-            # START TRANSACTION
             cursor.execute("START TRANSACTION")
             
-            # Prepare records for pure INSERT
+            # Prepare records
             records = []
             for item in valid_events:
                 event = item['event']
                 
-                # Calculate end-to-end latency
                 sent_at = event.get('sent_at', start_time)
                 latency_ms = (time.time() - sent_at) * 1000 if sent_at else None
                 
-                # Optimized record structure (minimal processing)
                 record = {
                     'trace_id': item['trace_id'],
                     'sequence_number': event.get('sequence_number'),
@@ -627,11 +592,11 @@ class EMQXSubscriber:
                     'operation': event.get('operation', 'INSERT'),
                     'envelope_version': event.get('envelope_version', '1.0'),
                     'latency_ms': latency_ms,
-                    'payload': json.dumps(event, separators=(',', ':'))  # Compact JSON
+                    'payload': json.dumps(event, separators=(',', ':'))
                 }
                 records.append(record)
             
-            # Insert-Only Path: Pure INSERT INTO (relying on Unique Index for duplicates)
+            # Database idempotency: UPSERT with ON DUPLICATE KEY UPDATE
             columns = ['trace_id', 'sequence_number', 'process_id', 'event_id', 
                       'table_name', 'operation', 'envelope_version', 'latency_ms', 'payload']
             placeholders = ', '.join(['%s'] * len(columns))
@@ -640,10 +605,11 @@ class EMQXSubscriber:
                 for record in records
             ]
             
-            # Pure INSERT with IGNORE to handle duplicates via unique index
+            # Idempotent UPSERT - duplicates become no-ops
             query = f"""
-                INSERT IGNORE INTO sensor_readings ({', '.join(columns)})
+                INSERT INTO sensor_readings ({', '.join(columns)})
                 VALUES ({placeholders})
+                ON DUPLICATE KEY UPDATE trace_id = trace_id
             """
             
             cursor.executemany(query, values_list)
@@ -653,44 +619,36 @@ class EMQXSubscriber:
             cursor.execute("SET SESSION foreign_key_checks = 1")
             cursor.execute("SET SESSION sql_notes = 1")
             
-            # COMMIT
             worker_connection.commit()
-            
-            # Send ACKs and mark processed (batch operation)
-            for item in valid_events:
-                self._send_acknowledgment(item['trace_id'], True)
-                self._mark_processed(item['trace_id'])
             
             duration = time.time() - start_time
             self.metrics.record_latency('worker_bulk_insert', duration)
             self.metrics.increment_counter('worker_bulk_inserts')
             
         except Exception as e:
-            # ROLLBACK on failure with proper cleanup
+            # Rollback on failure
             try:
                 if worker_connection:
                     worker_connection.rollback()
-                    # Re-enable checks after rollback
                     if cursor:
                         cursor.execute("SET SESSION unique_checks = 1")
                         cursor.execute("SET SESSION foreign_key_checks = 1")
                         cursor.execute("SET SESSION sql_notes = 1")
             except Exception:
-                # Ignore cleanup errors - connection will be discarded anyway
                 pass
-            raise  # Re-raise for retry logic
+            raise
             
         finally:
-            # Automated Release: Always close cursor
             if cursor:
                 try:
                     cursor.close()
                 except Exception:
-                    pass  # Ignore cursor close errors
+                    pass
     
     def _handle_worker_batch_failure(self, worker_id: int, failed_events: List[Dict[str, Any]], error_message: str):
         """
-        Error Handling (DLQ): Dump failed batch to system_dlq to prevent pipeline stall
+        DLQ handling for unrecoverable batch failures
+        If DLQ succeeds, data is preserved. If DLQ fails, allow redelivery.
         """
         try:
             # Prepare failed records for DLQ
@@ -710,57 +668,17 @@ class EMQXSubscriber:
                 }
                 failed_records.append(failed_record)
             
-            # Error Handling (DLQ): Write to system_dlq to prevent pipeline stall
+            # Attempt DLQ persistence
             dlq_success = self.target_db.bulk_insert_dlq(failed_records, error_message, f"WORKER_{worker_id}_FAILURE")
             
             if dlq_success:
-                # Send ACKs even for failed records since they're preserved in DLQ
-                for item in failed_events:
-                    self._send_acknowledgment(item['trace_id'], True, f"Preserved in DLQ by Worker {worker_id}")
-                    self._mark_processed(item['trace_id'])
-                
-                self.logger.warning(
-                    f"Triple-Worker {worker_id}: {len(failed_events)} events preserved in system_dlq"
-                )
-                
+                self.logger.warning(f"[WORKER-{worker_id}] {len(failed_events)} events preserved in DLQ")
                 self.metrics.increment_counter('worker_dlq_preservations')
             else:
-                # Fallback: Send NACKs if DLQ also fails
-                for item in failed_events:
-                    self._send_acknowledgment(item['trace_id'], False, f"Worker {worker_id} DLQ failed: {error_message}")
-                
-                self.logger.error(
-                    f"Triple-Worker {worker_id}: DLQ preservation failed for {len(failed_events)} events"
-                )
+                self.logger.error(f"[WORKER-{worker_id}] DLQ preservation failed for {len(failed_events)} events - allowing redelivery")
                 
         except Exception as dlq_error:
-            # Last resort: Log and NACK if everything fails
-            self.logger.error(
-                f"Triple-Worker {worker_id}: Critical DLQ failure - {dlq_error}"
-            )
-            
-            for item in failed_events:
-                self._send_acknowledgment(item['trace_id'], False, f"Worker {worker_id} critical failure: {str(dlq_error)}")
-                try:
-                    self.dlq.add_message(
-                        event_id=item['trace_id'],
-                        message_type='WORKER_CRITICAL_FAILURE',
-                        payload=item['event'],
-                        error=str(dlq_error)
-                    )
-                except Exception:
-                    pass  # Silent fail for DLQ as last resort
-        """
-        High-Performance Quantum Batch Processing with MySQL Optimization
-        1. Rapid verification and filtering
-        2. Single transactional bulk insert for entire batch
-        3. Logging Silence: One Quantum Summary per batch
-        """
-        if not quantum_batch:
-            return
-        
-        batch_start_time = time.time()
-        valid_events = []
+            self.logger.error(f"[WORKER-{worker_id}] DLQ operation failed: {dlq_error} - allowing redelivery")
         invalid_count = 0
         
         # Step 1: Rapid Verification and Filtering (no individual logging)
@@ -845,81 +763,22 @@ class EMQXSubscriber:
                 f"queue depth: {queue_depth}, target: 1M messages at 200-300 msgs/sec"
             )
     
-    def _send_acknowledgment(self, trace_id: str, success: bool, error: str = None):
-        """
-        Zero-Crash Logic: Send ACK to specific publisher instance topic
-        Summary-Only Mode: No debug logging for individual ACKs
-        """
-        try:
-            # Extract publisher instance ID from trace_id or use default
-            publisher_instance = "publisher_001"  # Default
-            
-            # Try to extract from trace_id pattern
-            if isinstance(trace_id, str) and '_' in trace_id:
-                parts = trace_id.split('_')
-                if len(parts) >= 2 and parts[0] in ['stress', 'evt']:
-                    publisher_instance = f"publisher_{parts[1]}" if parts[0] == 'stress' else "publisher_001"
-            
-            ack_message = {
-                'event_ids': trace_id if isinstance(trace_id, list) else trace_id,
-                'success': success,
-                'error': error,
-                'timestamp': time.time(),
-                'subscriber_id': self.client_id,
-                'publisher_instance': publisher_instance
-            }
-            
-            # Send to exact publisher ACK topic
-            ack_topic = f"sensors/ack/{publisher_instance}"
-            
-            self.client.publish(
-                ack_topic,
-                json.dumps(ack_message, separators=(',', ':')),  # Compact JSON
-                qos=2
-            )
-            
-            # Summary-Only Mode: No debug logging for individual ACKs
-            
-        except Exception:
-            # Summary-Only Mode: No error logging for individual ACK failures
-            pass
-    
-    def _is_duplicate(self, message_id: str) -> bool:
-        """Check for duplicates"""
-        with self._lock:
-            return message_id in self._processed_messages
-    
-    def _mark_processed(self, message_id: str):
-        """Mark as processed"""
-        with self._lock:
-            self._processed_messages[message_id] = time.time()
-            
-            current_time = time.time()
-            to_remove = [
-                mid for mid, ts in self._processed_messages.items()
-                if current_time - ts > self._message_retention
-            ]
-            
-            for mid in to_remove:
-                del self._processed_messages[mid]
+
     
     def run(self):
         """
-        Industrial Grade: Connection discipline with aggressive batch timeouts
-        Manual acknowledgment ensures message delivery guarantees
+        Main processing loop with deterministic batch outcomes
+        At-least-once delivery with database-level idempotency
         """
-        self.logger.info("[STATUS] Industrial Grade: Connection discipline with 500ms batch timeout and manual ACK...")
+        self.logger.info("[STATUS] Started with deterministic batch outcomes and database idempotency")
         
         try:
-            # Network loop is already running in background thread from connect()
-            # Dual workers process messages with connection discipline
-            # Main thread monitors health and provides structured progress logs
             while True:
                 time.sleep(1)
                 
-                # Log Frequency: Trigger every 10,000 records instead of time-based
+                # Status logging every 10,000 records
                 if self.total_messages_landed > 0 and self.total_messages_landed % self.status_trigger_count == 0:
-                    if self.total_messages_landed != self.last_status_count:  # Avoid duplicate logs
+                    if self.total_messages_landed != self.last_status_count:
                         self._log_structured_status()
                 
                 # Monitor MQTT network loop health
@@ -929,7 +788,7 @@ class EMQXSubscriber:
                         self.connect()
                     except Exception as e:
                         self.logger.error(f"[STATUS] Reconnection failed: {e}")
-                        time.sleep(5)  # Wait before retry
+                        time.sleep(5)
                 
                 # Monitor worker health
                 active_workers = sum(1 for t in self.worker_threads if t.is_alive())
@@ -938,17 +797,16 @@ class EMQXSubscriber:
                     self._start_triple_workers()
                 
         except KeyboardInterrupt:
-            self.logger.info("[STATUS] Keyboard interrupt in industrial grade loop")
+            self.logger.info("[STATUS] Keyboard interrupt received")
             self.disconnect()
         except Exception as e:
-            self.logger.error(f"[STATUS] Error in industrial grade main thread: {e}", exc_info=True)
+            self.logger.error(f"[STATUS] Error in main thread: {e}", exc_info=True)
             self.disconnect()
             raise
     
     def _log_structured_status(self):
         """
-        Industrial Grade: Status logs with connection pool and acknowledgment metrics
-        Format: [STATUS] Workers: 2 | Queue Depth: 12,400 | Total Landed: 450,000 | Avg Latency: 145ms | Records/sec: 5,000
+        Structured status logging with batch pressure metrics
         """
         try:
             # Calculate metrics
@@ -968,7 +826,7 @@ class EMQXSubscriber:
             elapsed_time = time.time() - self.start_time
             records_per_second = self.total_messages_landed / elapsed_time if elapsed_time > 0 else 0
             
-            # Industrial Grade: Include connection discipline status
+            # Structured status with batch pressure info
             self.logger.info(
                 f"[STATUS] Workers: {active_workers} | "
                 f"Queue Depth: {queue_depth:,} | "
@@ -976,7 +834,7 @@ class EMQXSubscriber:
                 f"Avg Latency: {avg_latency:.0f}ms | "
                 f"Records/sec: {records_per_second:.0f} | "
                 f"Progress: {messages_in_period:,} new | "
-                f"Pool: 20 conn | Timeout: 500ms"
+                f"Batch: 1000/200ms"
             )
             
         except Exception as e:

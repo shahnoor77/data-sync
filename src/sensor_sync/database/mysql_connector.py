@@ -433,7 +433,7 @@ class MySQLConnector(DatabaseConnector):
                 }
                 schema_agnostic_records.append(core_fields)
             
-            # Pure INSERT Speed: Optimized bulk insert without duplicate key handling
+            # Database idempotency: UPSERT with ON DUPLICATE KEY UPDATE
             columns = ['trace_id', 'sequence_number', 'process_id', 'event_id', 
                       'table_name', 'operation', 'envelope_version', 'latency_ms', 'payload']
             placeholders = ', '.join(['%s'] * len(columns))
@@ -442,10 +442,11 @@ class MySQLConnector(DatabaseConnector):
                 for record in schema_agnostic_records
             ]
             
-            # Pure INSERT Speed: Simple INSERT without ON DUPLICATE KEY UPDATE
+            # Idempotent UPSERT - duplicates become no-ops
             query = f"""
                 INSERT INTO {table} ({', '.join(columns)})
                 VALUES ({placeholders})
+                ON DUPLICATE KEY UPDATE trace_id = trace_id
             """
             
             # Pure INSERT Speed: cursor.executemany() for maximum throughput
