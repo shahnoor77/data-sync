@@ -37,9 +37,9 @@ class MySQLConnector(DatabaseConnector):
         self._connection_pool = None
         self._connection = None
         
-        # Pool configuration
+        # Pool configuration - Pool Expansion: Increased to 20 with pre-ping for zombie detection
         self.pool_name = f"mysql_pool_{uuid.uuid4().hex[:8]}"
-        self.pool_size = config.get('pool_size', 15)  # Level 1 requirement
+        self.pool_size = config.get('pool_size', 20)  # Pool Expansion: Increased to 20
         
         # Auto-migration flag
         self.auto_migrate = config.get('auto_migrate', True)
@@ -52,7 +52,7 @@ class MySQLConnector(DatabaseConnector):
             self._ensure_schema_ready()
     
     def _create_connection_pool(self):
-        """Create MySQL connection pool with optimized timeouts"""
+        """Create MySQL connection pool with zombie detection via enhanced health checks"""
         try:
             pool_config = {
                 'pool_name': self.pool_name,
@@ -78,10 +78,36 @@ class MySQLConnector(DatabaseConnector):
             }
             
             self._connection_pool = mysql.connector.pooling.MySQLConnectionPool(**pool_config)
-            print(f"✓ MySQL connection pool created: {self.pool_size} connections (30s timeout)")
+            print(f"✓ MySQL connection pool created: {self.pool_size} connections with enhanced health checks")
             
         except MySQLError as e:
             raise DatabaseFailure(f"Failed to create connection pool: {e}")
+    
+    def close_all_connections(self):
+        """
+        Pool Reset on Startup: Clear any zombie connections from previous runs
+        This ensures a clean slate when the subscriber starts up
+        """
+        try:
+            if self._connection_pool:
+                # Close current connection if exists
+                if self._connection and self._connection.is_connected():
+                    self._connection.close()
+                    self._connection = None
+                
+                # Force close all connections in the pool by recreating it
+                old_pool_name = self.pool_name
+                self.pool_name = f"mysql_pool_{uuid.uuid4().hex[:8]}"
+                
+                # Create new pool (old one will be garbage collected)
+                self._create_connection_pool()
+                
+                print(f"✓ Pool Reset: Cleared zombie connections, new pool: {self.pool_name}")
+                
+        except Exception as e:
+            print(f"Warning: Pool reset failed: {e}")
+            # Continue anyway - create new pool
+            self._create_connection_pool()
     
     def _ensure_schema_ready(self):
         """Auto-migration: Ensure Target Indexing for high-performance inserts"""
@@ -170,16 +196,57 @@ class MySQLConnector(DatabaseConnector):
                 self._return_connection(connection)
     
     def _get_connection(self):
-        """Get connection from pool"""
-        try:
-            return self._connection_pool.get_connection()
-        except MySQLError as e:
-            raise DatabaseFailure(f"Failed to get connection from pool: {e}")
+        """
+        Get connection from pool with enhanced health check for zombie detection
+        Implements manual ping validation since pool_pre_ping is not supported
+        """
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                connection = self._connection_pool.get_connection()
+                
+                # Pool Expansion: Manual zombie detection via ping
+                try:
+                    connection.ping(reconnect=False, attempts=1, delay=0)
+                    return connection
+                except MySQLError:
+                    # Connection is dead (zombie), discard it and get a fresh one
+                    try:
+                        connection.close()
+                    except:
+                        pass  # Ignore errors when closing dead connection
+                    
+                    if attempt < max_retries - 1:
+                        continue  # Try again with a new connection
+                    else:
+                        # Last attempt, try to get fresh connection with reconnect
+                        connection = self._connection_pool.get_connection()
+                        connection.ping(reconnect=True, attempts=1, delay=0)
+                        return connection
+                        
+            except MySQLError as e:
+                if attempt < max_retries - 1:
+                    time.sleep(0.1)  # Brief pause before retry
+                    continue
+                else:
+                    raise DatabaseFailure(f"Failed to get healthy connection from pool after {max_retries} attempts: {e}")
+        
+        raise DatabaseFailure("Failed to get connection from pool")
     
     def _return_connection(self, connection):
-        """Return connection to pool"""
-        if connection and connection.is_connected():
-            connection.close()  # Returns to pool
+        """
+        Return connection to pool with proper cleanup
+        Ensures connection is always returned even if it's in a bad state
+        """
+        if connection:
+            try:
+                # Always close the connection to return it to pool
+                # The pool will handle whether it's reusable or needs to be discarded
+                connection.close()
+            except Exception:
+                # Ignore errors during connection return
+                # The pool will handle cleanup of bad connections
+                pass
     
     @property
     def connection(self):
@@ -221,7 +288,7 @@ class MySQLConnector(DatabaseConnector):
     
     def bulk_insert_dlq(self, failed_records: List[Dict[str, Any]], error_message: str, error_type: str = "BULK_INSERT_FAILURE") -> bool:
         """
-        Universal Error Room: Pure INSERT Speed for DLQ operations
+        Universal Error Room: Pure INSERT Speed for DLQ operations with context manager pattern
         Preserves 1M messages for audit instead of NACKing
         
         Args:
@@ -240,6 +307,7 @@ class MySQLConnector(DatabaseConnector):
         batch_id = str(uuid.uuid4())
         
         try:
+            # Context Manager Pattern: Get connection with health check
             connection = self._get_connection()
             cursor = connection.cursor(buffered=False)  # Disable buffering for speed
             
@@ -290,26 +358,33 @@ class MySQLConnector(DatabaseConnector):
             return True
             
         except MySQLError as e:
-            if connection:
-                connection.rollback()
-                # Re-enable checks after rollback
-                try:
-                    cursor.execute("SET SESSION unique_checks = 1")
-                    cursor.execute("SET SESSION foreign_key_checks = 1")
-                    cursor.execute("SET SESSION sql_notes = 1")
-                except:
-                    pass
+            # ROLLBACK on failure with proper cleanup
+            try:
+                if connection:
+                    connection.rollback()
+                    # Re-enable checks after rollback
+                    if cursor:
+                        cursor.execute("SET SESSION unique_checks = 1")
+                        cursor.execute("SET SESSION foreign_key_checks = 1")
+                        cursor.execute("SET SESSION sql_notes = 1")
+            except Exception:
+                # Ignore cleanup errors - connection will be discarded
+                pass
             raise DatabaseFailure(f"DLQ insert failed: {e}")
             
         finally:
+            # Automated Release: Always clean up resources
             if cursor:
-                cursor.close()
+                try:
+                    cursor.close()
+                except Exception:
+                    pass  # Ignore cursor close errors
             if connection:
                 self._return_connection(connection)
     def bulk_insert(self, table: str, records: List[Dict[str, Any]]) -> bool:
         """
-        Pure INSERT Speed: Optimized bulk insert without metadata lookups
-        Uses cursor.executemany() for single transactional commit
+        Pure INSERT Speed: Optimized bulk insert with context manager pattern
+        Uses try...finally to ensure connection is always returned to pool
         
         Args:
             table: Target table name (typically 'sensor_readings')
@@ -329,7 +404,7 @@ class MySQLConnector(DatabaseConnector):
         trace_ids = [record.get('trace_id', 'unknown') for record in records]
         
         try:
-            # Get connection from pool
+            # Context Manager Pattern: Get connection with health check
             connection = self._get_connection()
             cursor = connection.cursor(buffered=False)  # Disable buffering for speed
             
@@ -388,15 +463,17 @@ class MySQLConnector(DatabaseConnector):
             
         except MySQLError as e:
             # ROLLBACK on failure (Level 1 requirement)
-            if connection:
-                connection.rollback()
-                # Re-enable checks after rollback
-                try:
-                    cursor.execute("SET SESSION unique_checks = 1")
-                    cursor.execute("SET SESSION foreign_key_checks = 1")
-                    cursor.execute("SET SESSION sql_notes = 1")
-                except:
-                    pass  # Ignore errors during cleanup
+            try:
+                if connection:
+                    connection.rollback()
+                    # Re-enable checks after rollback
+                    if cursor:
+                        cursor.execute("SET SESSION unique_checks = 1")
+                        cursor.execute("SET SESSION foreign_key_checks = 1")
+                        cursor.execute("SET SESSION sql_notes = 1")
+            except Exception:
+                # Ignore cleanup errors - connection will be discarded
+                pass
             
             # Raise DatabaseFailure with trace_ids (Level 1 requirement)
             raise DatabaseFailure(
@@ -405,8 +482,12 @@ class MySQLConnector(DatabaseConnector):
             )
             
         finally:
+            # Automated Release: Always clean up resources
             if cursor:
-                cursor.close()
+                try:
+                    cursor.close()
+                except Exception:
+                    pass  # Ignore cursor close errors
             if connection:
                 self._return_connection(connection)
     
