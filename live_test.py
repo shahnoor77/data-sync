@@ -24,8 +24,11 @@ except ImportError:
 # =========================
 # Configuration
 # =========================
-BROKER = os.getenv('MQTT_BROKER', 'emqx')
-PORT = int(os.getenv('MQTT_PORT', '1883'))
+BROKER = os.getenv('MQTT_BROKER_HOST')
+PORT = int(os.getenv('MQTT_BROKER_PORT'))
+USERNAME = os.getenv('MQTT_USERNAME')
+PASSWORD = os.getenv('MQTT_PASSWORD')
+CA_CERT_PATH = os.getenv('CA_CERT_PATH')
 TOTAL_MESSAGES = int(os.getenv('TOTAL_MESSAGES', '1000000'))
 CONCURRENCY = int(os.getenv('CONCURRENCY', '4'))
 TARGET_TOPIC = os.getenv('TARGET_TOPIC', 'sensors/live/stress_test')
@@ -36,8 +39,8 @@ INFLIGHT_THRESHOLD = 1000
 FLOW_CONTROL_SLEEP = 0.001  # 1ms
 
 # Crypto keys
-ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY', "7V6rZp9yXw2mQ8nB5jL1kH4sT3vG6aF9dC2eR1oN0uM=")
-SIGNING_KEY = os.getenv('SIGNING_KEY', "MySigningKeyAndWeCanAdjustItAsWeWant.")
+ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY')
+SIGNING_KEY = os.getenv('SIGNING_KEY')
 
 
 # =========================
@@ -53,20 +56,34 @@ def run_producer_process(process_id: int, message_count: int):
         inflight_count -= 1
         stats['messages_acked'] += 1
 
-    # MQTT client setup
-    client_id = f"stress_producer_{process_id}_{uuid.uuid4().hex[:6]}"
+    # MQTT client setup with TLS
+    client_id = f"cloud_stress_producer_{process_id}_{uuid.uuid4().hex[:6]}"
     client = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
         client_id=client_id,
         protocol=mqtt.MQTTv311,
         clean_session=False
     )
+    
+    # TLS Configuration for EMQX Cloud
+    if os.path.exists(CA_CERT_PATH):
+        client.tls_set(ca_certs=CA_CERT_PATH)
+        print(f"Producer {process_id}: TLS enabled with CA certificate")
+    else:
+        print(f"Producer {process_id}: Warning - CA certificate not found at {CA_CERT_PATH}")
+    
+    # Authentication
+    if USERNAME and PASSWORD:
+        client.username_pw_set(USERNAME, PASSWORD)
+        print(f"Producer {process_id}: Authentication configured")
+    
     client.max_inflight_messages_set(2000)
     client.on_publish = on_publish
 
     # Crypto Manager
     crypto = CryptoManager(ENCRYPTION_KEY, SIGNING_KEY)
 
+    print(f"Producer {process_id}: Connecting to {BROKER}:{PORT}")
     client.connect_async(BROKER, PORT, keepalive=60)
     client.loop_start()
 

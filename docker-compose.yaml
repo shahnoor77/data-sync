@@ -54,42 +54,7 @@ services:
     networks:
       - sensor_network
 
-  # EMQX Broker - Production MQTT with Global Self-Healing
-  emqx:
-    image: emqx/emqx:5.2
-    container_name: emqx_broker
-    ports:
-      - "1883:1883"    # MQTT
-      - "8883:8883"    # MQTT TLS
-      - "8081:8081"    # WebSocket
-      - "8084:8084"    # WebSocket TLS
-      - "18083:18083"  # Dashboard
-    environment:
-      - EMQX_NAME=emqx
-      - EMQX_HOST=127.0.0.1
-      - EMQX_CLUSTER__DISCOVERY_STRATEGY=static
-      - EMQX_DASHBOARD__DEFAULT_USERNAME=admin
-      - EMQX_DASHBOARD__DEFAULT_PASSWORD=public
-      - EMQX_PERSISTENCE__MESSAGES__STORAGE_TYPE=ram
-      # Global Self-Healing: QoS 2 handshake persistence
-      - EMQX_MQTT__MAX_INFLIGHT=10000
-      - EMQX_MQTT__MAX_AWAITING_REL=10000
-      - EMQX_MQTT__AWAIT_REL_TIMEOUT=300s
-      - EMQX_MQTT__SESSION_EXPIRY_INTERVAL=7200s
-    volumes:
-      # Global Self-Healing: Persistence for QoS 2 handshakes during restarts
-      - emqx_data:/opt/emqx/data
-      - emqx_etc:/opt/emqx/etc
-      - emqx_log:/opt/emqx/log
-    healthcheck:
-      test: ["CMD", "/opt/emqx/bin/emqx", "ctl", "status"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - sensor_network
-
-  # Level 0: Production Publisher with Resilient Ingestion
+  # Level 0: Production Publisher with EMQX Cloud Integration
   mqtt-publisher:
     build: .
     container_name: mqtt_publisher
@@ -97,66 +62,36 @@ services:
     environment:
       - SERVICE_MODE=publisher
       - INSTANCE_ID=publisher_001
-      - MQTT_BROKER=emqx
     depends_on:
       postgres-source:
-        condition: service_healthy
-      emqx:
         condition: service_healthy
     volumes:
       - ./data/offsets:/app/data/offsets
       - ./data/dlq:/app/data/dlq
       - ./logs:/app/logs
+      - ./emqx-ca-cert.pem:/app/emqx-ca-cert.pem:ro
     networks:
       - sensor_network
     restart: on-failure
 
-  # Level 2+3: High-Throughput Subscriber - Real-time Stream
-  mqtt-subscriber-live:
+  # Level 2+3: High-Throughput Subscriber - EMQX Cloud Integration
+  mqtt-subscriber:
     build: .
-    container_name: mqtt_subscriber_live
+    container_name: mqtt_subscriber
     env_file: .env
     environment:
       - SERVICE_MODE=subscriber
-      - INSTANCE_ID=sub_live_01
+      - INSTANCE_ID=cloud_subscriber_01
       - TOPIC_FILTER=sensors/live/#
-      - MQTT_BROKER=emqx
     depends_on:
       # Level 5: Health Dependency - Subscriber waits for MySQL health
       mysql-target:
         condition: service_healthy
-      emqx:
-        condition: service_healthy
     volumes:
       - ./data/dlq:/app/data/dlq
       - ./logs:/app/logs
-    # Level 5: Resources - Memory and CPU limits for RSA verification
-    mem_limit: 1gb
-    cpus: 1.5
-    networks:
-      - sensor_network
-    restart: on-failure
-
-  # Level 3: Multi-Instance - Batch Database Sync Processor
-  mqtt-subscriber-db:
-    build: .
-    container_name: mqtt_subscriber_db
-    env_file: .env
-    environment:
-      - SERVICE_MODE=subscriber
-      - INSTANCE_ID=sub_db_01
-      - TOPIC_FILTER=sensors/db/#
-      - MQTT_BROKER=emqx
-    depends_on:
-      # Level 5: Health Dependency - Subscriber waits for MySQL health
-      mysql-target:
-        condition: service_healthy
-      emqx:
-        condition: service_healthy
-    volumes:
-      - ./data/dlq:/app/data/dlq
-      - ./logs:/app/logs
-    # Level 5: Resources - Memory and CPU limits
+      - ./emqx-ca-cert.pem:/app/emqx-ca-cert.pem:ro
+    # Level 5: Resources - Memory and CPU limits for high-throughput processing
     mem_limit: 1gb
     cpus: 1.5
     networks:
@@ -171,6 +106,3 @@ volumes:
   postgres_source_data:
   # Level 5: Persistence - MySQL data volume for 1M+ records survival
   mysql_target_data:
-  emqx_data:
-  emqx_etc:
-  emqx_log:

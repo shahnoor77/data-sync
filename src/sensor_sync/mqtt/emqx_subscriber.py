@@ -140,11 +140,12 @@ class EMQXSubscriber:
                 self.target_db._return_connection(connection)
     
     def _setup_client(self):
-        """Setup EMQX MQTT client with Zero-Crash Logic and unique identity"""
+        """Setup EMQX MQTT client with TLS support for cloud serverless instance"""
         import uuid
+        import os
         
         # Zero-Crash Logic: Unique Identity with short UUID to prevent RC=7 Ghost Session collisions
-        base_client_id = self.mqtt_config.get('client_id_subscriber', "sub_live_01")
+        base_client_id = self.mqtt_config.get('client_id_subscriber', "cloud_sub_01")
         unique_suffix = str(uuid.uuid4())[:8]  # Short UUID: e.g., a8f2c4d1
         self.client_id = f"{base_client_id}_{unique_suffix}"
         
@@ -157,6 +158,14 @@ class EMQXSubscriber:
             protocol=mqtt.MQTTv311,
             clean_session=self.normal_clean_session  # Start with persistent sessions
         )
+        
+        # TLS Configuration for EMQX Cloud
+        ca_cert_path = os.getenv('CA_CERT_PATH', 'C:\\Users\\Administrator\\data-sync\\emqx-ca-cert.pem')
+        if os.path.exists(ca_cert_path):
+            self.client.tls_set(ca_certs=ca_cert_path)
+            self.logger.info(f"TLS enabled with CA certificate: {ca_cert_path}")
+        else:
+            self.logger.warning(f"CA certificate not found at {ca_cert_path}, proceeding without TLS")
         
         # Performance Tuning: Set max in-flight messages to 1,000 for smooth delivery during database spikes
         self.client.max_inflight_messages_set(1000)
@@ -189,7 +198,7 @@ class EMQXSubscriber:
         )
         
         self.logger.info(
-            f"Zero-Crash Logic: Unique client_id: {self.client_id}, "
+            f"EMQX Cloud subscriber configured with TLS - client_id: {self.client_id}, "
             f"max_inflight: 1000, socket_buffer: 4MB, clean_session: {self.normal_clean_session}"
         )
     

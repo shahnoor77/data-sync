@@ -6,12 +6,21 @@ RUN pip install paho-mqtt cryptography
 # Copy source code
 COPY src/ ./src/
 COPY live_test.py ./
+COPY test_emqx_cloud_connection.py ./
 
-# Environment variables
+# Copy EMQX CA certificate for TLS
+COPY emqx-ca-cert.pem /app/emqx-ca-cert.pem
+
+# Environment variables for EMQX Cloud
 ENV PYTHONPATH=/
 ENV TOTAL_MESSAGES=1000000
 ENV CONCURRENCY=4
 ENV TARGET_TOPIC=sensors/live/stress_test
+ENV MQTT_BROKER_HOST=
+ENV MQTT_BROKER_PORT=8883
+ENV MQTT_USERNAME=
+ENV MQTT_PASSWORD=
+ENV CA_CERT_PATH=
 ENV PYTHONUNBUFFERED=1
 
 CMD ["python", "live_test.py"]

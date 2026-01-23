@@ -58,9 +58,11 @@ class EMQXPublisher:
         self._setup_client()
     
     def _setup_client(self):
-        """Setup EMQX MQTT client with collision-aware connection logic and Session Wipe"""
+        """Setup EMQX MQTT client with TLS support for cloud serverless instance"""
+        import os
+        
         # Collision-Aware: Base client_id with revision counter for ID conflicts
-        base_client_id = self.config.get('client_id_publisher', f"prod_publisher_01")
+        base_client_id = self.config.get('client_id_publisher', f"cloud_publisher_01")
         self.client_id_revision = 0
         self.client_id = f"{base_client_id}_rev{self.client_id_revision}"
         
@@ -73,6 +75,14 @@ class EMQXPublisher:
             protocol=mqtt.MQTTv311,
             clean_session=self.normal_clean_session  # Start with persistent sessions
         )
+        
+        # TLS Configuration for EMQX Cloud
+        ca_cert_path = os.getenv('CA_CERT_PATH', '')
+        if os.path.exists(ca_cert_path):
+            self.client.tls_set(ca_certs=ca_cert_path)
+            self.logger.info(f"TLS enabled with CA certificate: {ca_cert_path}")
+        else:
+            self.logger.warning(f"CA certificate not found at {ca_cert_path}, proceeding without TLS")
         
         # Set max in-flight BEFORE connect
         self.client.max_inflight_messages_set(
@@ -99,7 +109,7 @@ class EMQXPublisher:
         )
         
         self.logger.info(
-            f"EMQX publisher configured with collision-aware client_id: {self.client_id}, "
+            f"EMQX Cloud publisher configured with TLS - client_id: {self.client_id}, "
             f"max_inflight: {self.config.get('max_inflight_messages', 2000)}, clean_session: {self.normal_clean_session}"
         )
     

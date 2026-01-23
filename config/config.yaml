@@ -16,15 +16,19 @@ change_detection:
   enable_snapshot_on_start: true
 
 mqtt:
-  # EMQX Configuration with Stable IDs
+  # EMQX Cloud Serverless Configuration
   broker_host: "${MQTT_BROKER_HOST}"
   broker_port: "${MQTT_BROKER_PORT}"
   username: "${MQTT_USERNAME}"
   password: "${MQTT_PASSWORD}"
   
+  # TLS Configuration for EMQX Cloud
+  tls_enabled: true
+  ca_cert_path: ""
+  
   # FIXED client IDs for session persistence
-  client_id_publisher: "prod_publisher_01"
-  client_id_subscriber: "prod_subscriber_01"
+  client_id_publisher: "cloud_publisher_01"
+  client_id_subscriber: "cloud_subscriber_01"
   
   # EMQX-Specific Settings
   protocol_version: 5
@@ -40,7 +44,7 @@ mqtt:
   # High-Throughput Settings
   qos_publish: 2
   qos_subscribe: 2
-  max_inflight_messages: 200  # Increased from 100
+  max_inflight_messages: 1000  # Optimized for cloud
   max_mqueue_len: 100000  # Max message queue
   message_ordering: true
   
