@@ -76,10 +76,15 @@ class EMQXPublisher:
             clean_session=self.normal_clean_session  # Start with persistent sessions
         )
         
-        # TLS Configuration for EMQX Cloud
-        ca_cert_path = os.getenv('CA_CERT_PATH', '')
+        # TLS Configuration for EMQX Cloud Serverless
+        ca_cert_path = os.getenv('CA_CERT_PATH', '/app/emqx-ca-cert.pem')
         if os.path.exists(ca_cert_path):
-            self.client.tls_set(ca_certs=ca_cert_path)
+            import ssl
+            self.client.tls_set(
+                ca_certs=ca_cert_path,
+                tls_version=ssl.PROTOCOL_TLSv1_2
+            )
+            self.client.tls_insecure_set(False)  # Serverless security requirement
             self.logger.info(f"TLS enabled with CA certificate: {ca_cert_path}")
         else:
             self.logger.warning(f"CA certificate not found at {ca_cert_path}, proceeding without TLS")
@@ -122,7 +127,7 @@ class EMQXPublisher:
             try:
                 broker_host = self.config['broker_host']
                 broker_port = int(self.config['broker_port'])
-                keepalive = int(self.config.get('keepalive', 60))  # Increase Keep-Alive: 60 seconds
+                keepalive = 60  # Cloud-optimized keepalive for NAT/Firewall traversal
                 
                 # Apply Session Wipe if needed for ID rejection recovery
                 current_clean_session = self.clean_session_override or self.normal_clean_session

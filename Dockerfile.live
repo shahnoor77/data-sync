@@ -1,26 +1,24 @@
 FROM python:3.11-slim
 
-# Install high-performance packages with C-extensions
-RUN pip install paho-mqtt cryptography
+# Install dependencies
+RUN pip install --no-cache-dir paho-mqtt cryptography dotenv
 
-# Copy source code
+# Copy application code
 COPY src/ ./src/
 COPY live_test.py ./
 COPY test_emqx_cloud_connection.py ./
+COPY health_check.py ./
 
-# Copy EMQX CA certificate for TLS
+# Copy EMQX Cloud CA certificate
 COPY emqx-ca-cert.pem /app/emqx-ca-cert.pem
 
-# Environment variables for EMQX Cloud
+# Runtime configuration (NON-SECRET)
 ENV PYTHONPATH=/
-ENV TOTAL_MESSAGES=1000000
-ENV CONCURRENCY=4
-ENV TARGET_TOPIC=sensors/live/stress_test
-ENV MQTT_BROKER_HOST=
 ENV MQTT_BROKER_PORT=8883
-ENV MQTT_USERNAME=
-ENV MQTT_PASSWORD=
-ENV CA_CERT_PATH=
+ENV CA_CERT_PATH=/app/emqx-ca-cert.pem
+ENV TARGET_TOPIC=sensors/live/stress_test
+ENV TOTAL_MESSAGES=10000
+ENV CONCURRENCY=2
 ENV PYTHONUNBUFFERED=1
 
 CMD ["python", "live_test.py"]

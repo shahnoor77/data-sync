@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-High-Throughput Multi-Processed Stress Testing Tool (Realistic Sensor Simulation)
+EMQX Cloud Serverless Stress Testing Tool
+Tests TLS connectivity, authentication, and high-throughput message delivery
 """
 
 import time
@@ -10,8 +11,12 @@ import multiprocessing
 import os
 import sys
 import random
+import ssl
+import socket
 from datetime import datetime, timezone
 import paho.mqtt.client as mqtt
+from dotenv import load_dotenv
+load_dotenv()
 
 # Add src to path for CryptoManager
 sys.path.append(os.path.join(os.getcwd(), 'src'))
@@ -20,199 +25,166 @@ try:
 except ImportError:
     sys.path.append(os.getcwd())
     from sensor_sync.utils.crypto import CryptoManager
+# =========================
+# CONFIG
+# =========================
+BROKER = os.getenv("MQTT_BROKER_HOST")
+PORT = int(os.getenv("MQTT_BROKER_PORT", "8883"))
+USERNAME = os.getenv("MQTT_USERNAME")
+PASSWORD = os.getenv("MQTT_PASSWORD")
+CA_CERT_PATH = os.getenv("CA_CERT_PATH", "/app/emqx-ca-cert.pem")
+
+TOTAL_MESSAGES = int(os.getenv("TOTAL_MESSAGES", "10000"))
+CONCURRENCY = int(os.getenv("CONCURRENCY", "2"))
+TOPIC = os.getenv("TARGET_TOPIC", "sensors/live/stress_test")
+
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "dev-encryption-key")
+SIGNING_KEY = os.getenv("SIGNING_KEY", "dev-signing-key")
+
+INFLIGHT_LIMIT = 200
+BURST_SIZE = 100
+CONNECT_TIMEOUT = 20
 
 # =========================
-# Configuration
+# VALIDATION
 # =========================
-BROKER = os.getenv('MQTT_BROKER_HOST')
-PORT = int(os.getenv('MQTT_BROKER_PORT'))
-USERNAME = os.getenv('MQTT_USERNAME')
-PASSWORD = os.getenv('MQTT_PASSWORD')
-CA_CERT_PATH = os.getenv('CA_CERT_PATH')
-TOTAL_MESSAGES = int(os.getenv('TOTAL_MESSAGES', '1000000'))
-CONCURRENCY = int(os.getenv('CONCURRENCY', '4'))
-TARGET_TOPIC = os.getenv('TARGET_TOPIC', 'sensors/live/stress_test')
+def validate():
+    missing = []
+    if not BROKER: missing.append("MQTT_BROKER_HOST")
+    if not USERNAME: missing.append("MQTT_USERNAME")
+    if not PASSWORD: missing.append("MQTT_PASSWORD")
+    if not os.path.exists(CA_CERT_PATH): missing.append("CA_CERT_PATH")
 
-# Burst Mode Configuration
-BURST_SIZE = 5000
-INFLIGHT_THRESHOLD = 1000
-FLOW_CONTROL_SLEEP = 0.001  # 1ms
+    if missing:
+        print(f"❌ Missing config: {', '.join(missing)}")
+        return False
 
-# Crypto keys
-ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY')
-SIGNING_KEY = os.getenv('SIGNING_KEY')
-
+    print("✅ Configuration OK")
+    print(f"Broker: {BROKER}:{PORT}")
+    print(f"Topic: {TOPIC}")
+    return True
 
 # =========================
-# Producer Process
+# CONNECTIVITY TEST
 # =========================
-def run_producer_process(process_id: int, message_count: int):
-    stats = {'messages_sent': 0, 'messages_acked': 0, 'crypto_failures': 0, 'flow_control_pauses': 0}
-    sequence_number = 0
-    inflight_count = 0
+def connectivity_test():
+    try:
+        context = ssl.create_default_context()
+        context.load_verify_locations(CA_CERT_PATH)
 
-    def on_publish(client, userdata, mid, reason_code, properties=None):
-        nonlocal inflight_count
-        inflight_count -= 1
-        stats['messages_acked'] += 1
+        with socket.create_connection((BROKER, PORT), timeout=10) as sock:
+            with context.wrap_socket(sock, server_hostname=BROKER):
+                print("✅ TLS handshake successful")
+                return True
+    except Exception as e:
+        print(f"❌ TLS failed: {e}")
+        return False
 
-    # MQTT client setup with TLS
-    client_id = f"cloud_stress_producer_{process_id}_{uuid.uuid4().hex[:6]}"
-    client = mqtt.Client(
-        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-        client_id=client_id,
-        protocol=mqtt.MQTTv311,
-        clean_session=False
-    )
-    
-    # TLS Configuration for EMQX Cloud
-    if os.path.exists(CA_CERT_PATH):
-        client.tls_set(ca_certs=CA_CERT_PATH)
-        print(f"Producer {process_id}: TLS enabled with CA certificate")
-    else:
-        print(f"Producer {process_id}: Warning - CA certificate not found at {CA_CERT_PATH}")
-    
-    # Authentication
-    if USERNAME and PASSWORD:
-        client.username_pw_set(USERNAME, PASSWORD)
-        print(f"Producer {process_id}: Authentication configured")
-    
-    client.max_inflight_messages_set(2000)
-    client.on_publish = on_publish
+# =========================
+# PRODUCER
+# =========================
+def producer(proc_id, count):
+    sent = acked = 0
+    inflight = 0
+    connected = False
 
-    # Crypto Manager
     crypto = CryptoManager(ENCRYPTION_KEY, SIGNING_KEY)
 
-    print(f"Producer {process_id}: Connecting to {BROKER}:{PORT}")
+    def on_connect(c, u, f, rc, p=None):
+        nonlocal connected
+        connected = (rc == 0)
+        print(f"[P{proc_id}] Connected (rc={rc})")
+
+    def on_publish(c, u, mid, rc=None, p=None):
+        nonlocal inflight, acked
+        inflight -= 1
+        acked += 1
+
+    client = mqtt.Client(
+        client_id=f"cloud-producer-{proc_id}-{uuid.uuid4().hex[:6]}",
+        protocol=mqtt.MQTTv311,
+        clean_session=True
+    )
+
+    client.username_pw_set(USERNAME, PASSWORD)
+    client.tls_set(CA_CERT_PATH, tls_version=ssl.PROTOCOL_TLSv1_2)
+    client.max_inflight_messages_set(INFLIGHT_LIMIT)
+
+    client.on_connect = on_connect
+    client.on_publish = on_publish
+
     client.connect_async(BROKER, PORT, keepalive=60)
     client.loop_start()
 
-    # Wait for connection
-    start_time = time.time()
-    while not client.is_connected() and (time.time() - start_time) < 10:
+    t0 = time.time()
+    while not connected and time.time() - t0 < CONNECT_TIMEOUT:
         time.sleep(0.1)
 
-    if not client.is_connected():
-        print(f"Producer {process_id}: Connection failed")
-        return
+    if not connected:
+        print(f"[P{proc_id}] ❌ Connect timeout")
+        return sent, acked
 
-    print(f"Producer {process_id}: Connected, sending {message_count} messages")
-    total_sent = 0
-    test_start = time.time()
+    for i in range(count):
+        while inflight >= INFLIGHT_LIMIT:
+            time.sleep(0.01)
 
-    while total_sent < message_count:
-        # Adaptive burst
-        burst_size = min(BURST_SIZE, INFLIGHT_THRESHOLD - inflight_count, message_count - total_sent)
-        if burst_size <= 0:
-            # Wait for inflight to reduce
-            while inflight_count > INFLIGHT_THRESHOLD * 0.7:
-                stats['flow_control_pauses'] += 1
-                time.sleep(FLOW_CONTROL_SLEEP)
-            continue
+        event = {
+            "event_id": str(uuid.uuid4()),
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "sensor_id": f"s-{proc_id}",
+            "value": round(random.uniform(20, 30), 2)
+        }
 
-        for _ in range(burst_size):
-            sequence_number += 1
-            trace_id = str(uuid.uuid4())
-            timestamp = datetime.now(timezone.utc).isoformat()
-            envelope_version = "1.0"
+        payload = crypto.create_signed_message(event)
 
-            # Realistic sensor data
-            event = {
-                "trace_id": trace_id,
-                "sequence_number": sequence_number,
-                "process_id": process_id,
-                "timestamp": timestamp,
-                "envelope_version": envelope_version,
-                "event_id": f"stress_{process_id}_{sequence_number}_{uuid.uuid4().hex[:8]}",
-                "table": "sensor_readings",
-                "operation": "INSERT",
-                "sent_at": time.time(),
-                "data": {
-                    "sensor_id": f"sensor_{process_id}",
-                    "temperature": round(random.uniform(15.0, 30.0), 2),
-                    "humidity": round(random.uniform(30.0, 80.0), 2),
-                    "pressure": round(random.uniform(950.0, 1050.0), 2),
-                    "location": f"zone_{process_id}"
-                },
-                "envelope_metadata": {
-                    "version": envelope_version,
-                    "schema_version": "1.0",
-                    "format": "json",
-                    "created_by": "stress_test",
-                    "created_at": timestamp
-                }
-            }
+        res = client.publish(TOPIC, json.dumps(payload), qos=1)
+        if res.rc == mqtt.MQTT_ERR_SUCCESS:
+            sent += 1
+            inflight += 1
 
-            # Sign & encrypt
-            try:
-                signed_message = crypto.create_signed_message(event)
-                payload = {"message": signed_message}
-            except Exception:
-                stats['crypto_failures'] += 1
-                continue
+        if sent % 1000 == 0:
+            print(f"[P{proc_id}] Sent {sent}")
 
-            # Publish
-            result = client.publish(TARGET_TOPIC, json.dumps(payload, separators=(',', ':')), qos=2)
-            if result.rc == mqtt.MQTT_ERR_SUCCESS:
-                inflight_count += 1
-                stats['messages_sent'] += 1
-                total_sent += 1
+    while inflight > 0:
+        time.sleep(0.1)
 
-        # Flow control
-        if inflight_count > INFLIGHT_THRESHOLD * 0.9:
-            while inflight_count > INFLIGHT_THRESHOLD * 0.7:
-                stats['flow_control_pauses'] += 1
-                time.sleep(FLOW_CONTROL_SLEEP)
-
-        # Progress update
-        if total_sent % 50000 == 0:
-            elapsed = time.time() - test_start
-            rate = total_sent / elapsed if elapsed > 0 else 0
-            print(f"Producer {process_id}: {total_sent}/{message_count} ({rate:.0f} msg/s)")
-
-    # Wait for all acks
-    while inflight_count > 0:
-        time.sleep(0.01)
-
-    client.loop_stop()
     client.disconnect()
-    duration = time.time() - test_start
-    final_rate = message_count / duration if duration > 0 else 0
-    print(f"Producer {process_id}: Complete - {stats['messages_sent']} sent, "
-          f"{stats['messages_acked']} acked, {final_rate:.0f} msg/s")
+    client.loop_stop()
 
+    print(f"[P{proc_id}] Done | Sent={sent} Acked={acked}")
+    return sent, acked
 
 # =========================
-# Main Runner
+# MAIN
 # =========================
 def main():
-    print(f"🚀 High-Throughput Stress Test")
-    print(f"Messages: {TOTAL_MESSAGES:,}, Processes: {CONCURRENCY}")
-    print(f"Topic: {TARGET_TOPIC}, Broker: {BROKER}:{PORT}")
+    print("🚀 EMQX Cloud Stress Test")
 
-    messages_per_process = TOTAL_MESSAGES // CONCURRENCY
-    remainder = TOTAL_MESSAGES % CONCURRENCY
+    if not validate():
+        return 1
 
-    # Prepare process arguments
-    process_args = []
-    for i in range(CONCURRENCY):
-        count = messages_per_process + (1 if i < remainder else 0)
-        process_args.append((i, count))
+    if not connectivity_test():
+        return 1
 
-    start_time = time.time()
+    per_proc = TOTAL_MESSAGES // CONCURRENCY
+    args = [(i, per_proc) for i in range(CONCURRENCY)]
 
-    # Start multi-process pool
-    with multiprocessing.Pool(processes=CONCURRENCY) as pool:
-        pool.starmap(run_producer_process, process_args)
+    start = time.time()
+    with multiprocessing.Pool(CONCURRENCY) as p:
+        results = p.starmap(producer, args)
 
-    duration = time.time() - start_time
-    throughput = TOTAL_MESSAGES / duration if duration > 0 else 0
+    sent = sum(r[0] for r in results)
+    acked = sum(r[1] for r in results)
+    dur = time.time() - start
 
-    print(f"\n✅ Test Complete")
-    print(f"Duration: {duration:.2f}s")
-    print(f"Throughput: {throughput:.0f} msg/s")
+    print("=" * 50)
+    print(f"Sent: {sent}")
+    print(f"Acked: {acked}")
+    print(f"ACK Rate: {(acked/sent)*100:.2f}%")
+    print(f"Throughput: {sent/dur:.0f} msg/s")
 
+    return 0 if acked >= sent * 0.95 else 1
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method('spawn', force=True)
-    main()
+    multiprocessing.set_start_method("spawn", force=True)
+    exit(main())

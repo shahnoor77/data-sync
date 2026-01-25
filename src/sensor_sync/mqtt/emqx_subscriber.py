@@ -11,6 +11,7 @@ import time
 import uuid
 import threading
 import queue
+import random
 from typing import Dict, Any, List
 import paho.mqtt.client as mqtt
 from paho.mqtt.packettypes import PacketTypes
@@ -52,8 +53,9 @@ class EMQXSubscriber:
         # Extract instance_id for targeted feedback
         self.instance_id = mqtt_config.get('client_id_subscriber', 'subscriber_001')
         
-        # Triple-Worker Concurrency: Shared queue with 3 independent workers
-        self.internal_queue = queue.Queue(maxsize=50000)  # Shared queue for all workers
+        # Memory Management: Calculate buffer for 2,500 msg/s with 100ms cloud latency
+        # Buffer = msg_rate * latency_seconds * safety_factor = 2500 * 0.1 * 10 = 2,500 messages
+        self.internal_queue = queue.Queue(maxsize=25000)  # 10x safety buffer for cloud latency
         
         # Industrial Grade Configuration with Reduced Batch Pressure
         self.num_workers = 2              # Dual workers for parallel processing
@@ -151,18 +153,23 @@ class EMQXSubscriber:
         
         # Session Wipe: Track clean_session state for ID rejection recovery
         self.clean_session_override = False  # Temporary override for session wipe
-        self.normal_clean_session = False    # Normal persistent session mode
+        self.normal_clean_session = False    # Persistent sessions for cloud buffering
         
         self.client = mqtt.Client(
             client_id=self.client_id,
             protocol=mqtt.MQTTv311,
-            clean_session=self.normal_clean_session  # Start with persistent sessions
+            clean_session=self.normal_clean_session  # Persistent sessions for reliability
         )
         
-        # TLS Configuration for EMQX Cloud
-        ca_cert_path = os.getenv('CA_CERT_PATH', 'C:\\Users\\Administrator\\data-sync\\emqx-ca-cert.pem')
+        # TLS Configuration for EMQX Cloud Serverless
+        ca_cert_path = os.getenv('CA_CERT_PATH', '/app/emqx-ca-cert.pem')
         if os.path.exists(ca_cert_path):
-            self.client.tls_set(ca_certs=ca_cert_path)
+            import ssl
+            self.client.tls_set(
+                ca_certs=ca_cert_path,
+                tls_version=ssl.PROTOCOL_TLSv1_2
+            )
+            self.client.tls_insecure_set(False)  # Serverless security requirement
             self.logger.info(f"TLS enabled with CA certificate: {ca_cert_path}")
         else:
             self.logger.warning(f"CA certificate not found at {ca_cert_path}, proceeding without TLS")
@@ -203,7 +210,7 @@ class EMQXSubscriber:
         )
     
     def connect(self):
-        """Connect to EMQX broker using Non-Blocking Loop with keepalive=120"""
+        """Connect to EMQX broker with exponential backoff for RC=7 handling"""
         # Initialization Guard: Ensure database is connected before MQTT loop
         if not self.target_db.is_connected():
             self.logger.info("Database not connected, attempting to connect...")
@@ -216,14 +223,14 @@ class EMQXSubscriber:
             try:
                 broker_host = self.mqtt_config['broker_host']
                 broker_port = int(self.mqtt_config['broker_port'])
-                keepalive = 120  # Zero-Crash Logic: 120 seconds keepalive for stability
+                keepalive = 60  # Cloud-optimized keepalive for NAT/Firewall traversal
                 
                 # Apply Session Wipe if needed for ID rejection recovery
                 current_clean_session = self.clean_session_override or self.normal_clean_session
                 self.client.clean_session = current_clean_session
                 
                 self.logger.info(
-                    f"Zero-Crash Logic: Connecting to EMQX: {broker_host}:{broker_port} "
+                    f"Cloud Connection: Connecting to EMQX: {broker_host}:{broker_port} "
                     f"(attempt {retry_count + 1}/{max_retries}, client_id: {self.client_id}, "
                     f"keepalive: {keepalive}s, clean_session: {current_clean_session})"
                 )
@@ -239,7 +246,7 @@ class EMQXSubscriber:
                 self.client.loop_start()
                 
                 # Wait for connection with timeout
-                timeout = 10
+                timeout = 15  # Increased timeout for cloud connections
                 start_time = time.time()
                 while not self.connected and (time.time() - start_time) < timeout:
                     time.sleep(0.1)
@@ -255,7 +262,7 @@ class EMQXSubscriber:
                 # Start Triple-Worker Concurrency
                 self._start_triple_workers()
                 
-                self.logger.info(f"✓ Zero-Crash Logic: Connected with unique client_id: {self.client_id}")
+                self.logger.info(f"✓ Cloud Connection: Connected with unique client_id: {self.client_id}")
                 return
                 
             except Exception as e:
@@ -267,9 +274,9 @@ class EMQXSubscriber:
                     self.client.loop_stop()
                 
                 if retry_count < max_retries:
-                    # Give EMQX time to release the socket
-                    time.sleep(1)
-                    backoff = min(2 ** retry_count, 30)
+                    # Exponential backoff with jitter for cloud connections
+                    backoff = min(2 ** retry_count, 60) + random.uniform(0, 5)
+                    self.logger.info(f"Exponential backoff: waiting {backoff:.1f}s before retry")
                     time.sleep(backoff)
                 else:
                     raise
@@ -316,13 +323,19 @@ class EMQXSubscriber:
     
     def _on_disconnect(self, client, userdata, rc, properties=None):
         """
-        Callback for disconnect with Zero-Crash Logic for unique client ID handling
-        RC 2 = ID Rejected, but with unique UUIDs this should be rare
+        Callback for disconnect with RC=7 specific handling and exponential backoff
         """
         self.connected = False
         self.metrics.set_gauge('mqtt_connected', 0)
         
-        if rc == 2:  # ID Rejected - Should be rare with unique UUIDs
+        if rc == 7:  # RC=7 Connection refused, not authorized
+            self.logger.error(
+                f"[STATUS] RC=7 Authorization failed - check credentials and TLS configuration"
+            )
+            # Don't retry immediately for auth failures
+            time.sleep(10)
+            
+        elif rc == 2:  # ID Rejected - Should be rare with unique UUIDs
             import uuid
             base_client_id = self.mqtt_config.get('client_id_subscriber', "sub_live_01")
             unique_suffix = str(uuid.uuid4())[:8]  # Generate new unique suffix
@@ -590,7 +603,7 @@ class EMQXSubscriber:
                 event = item['event']
                 
                 sent_at = event.get('sent_at', start_time)
-                latency_ms = (time.time() - sent_at) * 1000 if sent_at else None
+                cloud_latency_ms = (time.time() - sent_at) * 1000 if sent_at else None
                 
                 record = {
                     'trace_id': item['trace_id'],
@@ -600,7 +613,7 @@ class EMQXSubscriber:
                     'table_name': event.get('table', 'sensor_readings'),
                     'operation': event.get('operation', 'INSERT'),
                     'envelope_version': event.get('envelope_version', '1.0'),
-                    'latency_ms': latency_ms,
+                    'latency_ms': cloud_latency_ms,
                     'payload': json.dumps(event, separators=(',', ':'))
                 }
                 records.append(record)
@@ -688,91 +701,6 @@ class EMQXSubscriber:
                 
         except Exception as dlq_error:
             self.logger.error(f"[WORKER-{worker_id}] DLQ operation failed: {dlq_error} - allowing redelivery")
-        invalid_count = 0
-        
-        # Step 1: Rapid Verification and Filtering (no individual logging)
-        for topic, payload in quantum_batch:
-            try:
-                # Parse JSON
-                try:
-                    parsed_payload = json.loads(payload)
-                except json.JSONDecodeError:
-                    invalid_count += 1
-                    continue
-                
-                # Extract signed event
-                signed_event = None
-                if isinstance(parsed_payload, dict):
-                    if 'message' in parsed_payload and isinstance(parsed_payload['message'], dict):
-                        signed_event = parsed_payload['message']
-                    else:
-                        signed_event = parsed_payload
-                
-                if not signed_event:
-                    invalid_count += 1
-                    continue
-                
-                # High-Performance: Skip signature verification for stress test messages
-                # This dramatically improves throughput during 1M message bursts
-                event = signed_event.get('message', {})
-                trace_id = event.get('trace_id')
-                
-                if not trace_id:
-                    invalid_count += 1
-                    continue
-                
-                # Check for duplicates
-                if self._is_duplicate(trace_id):
-                    self._send_acknowledgment(trace_id, True, "Duplicate")
-                    continue
-                
-                # Skip decryption for stress test data (performance optimization)
-                valid_events.append({
-                    'trace_id': trace_id,
-                    'event': event,
-                    'timestamp': time.time()
-                })
-                
-            except Exception:
-                invalid_count += 1
-        
-        # Step 2: MySQL Optimization - Single transactional bulk insert
-        if valid_events:
-            try:
-                self._bulk_insert_optimized(valid_events)
-                
-                # Step 3: Logging Silence - One Quantum Summary per batch
-                processing_time = (time.time() - batch_start_time) * 1000
-                throughput = len(valid_events) / (processing_time / 1000) if processing_time > 0 else 0
-                
-                # Single log entry for entire batch with optimized throughput tracking
-                self.logger.info(
-                    f"Optimized Throughput: Quantum batch processed",
-                    extra={
-                        "event": "batch_committed",
-                        "count": len(valid_events),
-                        "invalid_count": invalid_count,
-                        "duration_ms": round(processing_time, 2),
-                        "throughput_msg_per_sec": round(throughput, 0),
-                        "batch_size": len(quantum_batch),
-                        "target_throughput": "200-300 msgs/sec stable"
-                    }
-                )
-                
-            except Exception as e:
-                self.logger.error(f"High-Performance: Quantum batch failed: {e}")
-        
-        self.messages_processed += len(quantum_batch)
-        
-        # Optimized frequency health logging (every 50K messages for stable throughput)
-        if self.messages_processed % 50000 == 0:
-            queue_depth = self.ingestion_queue.qsize()
-            self.logger.info(
-                f"Optimized Throughput Health: {self.messages_processed:,} messages processed, "
-                f"queue depth: {queue_depth}, target: 1M messages at 200-300 msgs/sec"
-            )
-    
-
     
     def run(self):
         """
