@@ -19,22 +19,42 @@ wheels/
 .installed.cfg
 *.egg
 
+# Environment files and secrets
 .env
+.env.*
 .venv
 env/
 venv/
+*secrets*.txt
+*secrets*.env
 
+# Application data
 data/offsets/*
 data/history/*
 logs/*
 *.log
 
+# IDE files
 .idea/
 .vscode/
 *.swp
 *.swo
 
+# JAR files
 debezium/lib/*.jar
-certs/*.key
-certs/*.crt
-certs/*.pem
+
+# TLS Certificates and keys (SECURITY CRITICAL)
+certs/
+*.key
+*.crt
+*.pem
+deployment/certs/
+*-cert.pem
+*-key.pem
+ca-cert.pem
+server-cert.pem
+server-key.pem
+
+# Railway deployment secrets
+railway-secrets.txt
+.railway/

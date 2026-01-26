@@ -16,6 +16,8 @@ import socket
 from datetime import datetime, timezone
 import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
+
+# Load environment variables from .env file
 load_dotenv()
 
 # Add src to path for CryptoManager
@@ -25,6 +27,7 @@ try:
 except ImportError:
     sys.path.append(os.getcwd())
     from sensor_sync.utils.crypto import CryptoManager
+
 # =========================
 # CONFIG
 # =========================
@@ -32,14 +35,18 @@ BROKER = os.getenv("MQTT_BROKER_HOST")
 PORT = int(os.getenv("MQTT_BROKER_PORT", "8883"))
 USERNAME = os.getenv("MQTT_USERNAME")
 PASSWORD = os.getenv("MQTT_PASSWORD")
-CA_CERT_PATH = os.getenv("CA_CERT_PATH", "/app/emqx-ca-cert.pem")
+
+# Fix CA cert path - use local file for testing
+CA_CERT_PATH = os.getenv("CA_CERT_PATH", "emqx-ca-cert.pem")
+if not os.path.exists(CA_CERT_PATH):
+    CA_CERT_PATH = "emqx-ca-cert.pem"  # Fallback to local file
 
 TOTAL_MESSAGES = int(os.getenv("TOTAL_MESSAGES", "10000"))
 CONCURRENCY = int(os.getenv("CONCURRENCY", "2"))
-TOPIC = os.getenv("TARGET_TOPIC", "sensors/live/stress_test")
+TOPIC = os.getenv("MQTT_TOPIC_PREFIX", "sensors/live/stress_test")
 
-ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "dev-encryption-key")
-SIGNING_KEY = os.getenv("SIGNING_KEY", "dev-signing-key")
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
+SIGNING_KEY = os.getenv("SIGNING_KEY")
 
 INFLIGHT_LIMIT = 200
 BURST_SIZE = 100
@@ -49,19 +56,28 @@ CONNECT_TIMEOUT = 20
 # VALIDATION
 # =========================
 def validate():
+    print("🔧 Validating configuration...")
     missing = []
+    
     if not BROKER: missing.append("MQTT_BROKER_HOST")
-    if not USERNAME: missing.append("MQTT_USERNAME")
+    if not USERNAME: missing.append("MQTT_USERNAME") 
     if not PASSWORD: missing.append("MQTT_PASSWORD")
-    if not os.path.exists(CA_CERT_PATH): missing.append("CA_CERT_PATH")
-
+    if not ENCRYPTION_KEY: missing.append("ENCRYPTION_KEY")
+    if not SIGNING_KEY: missing.append("SIGNING_KEY")
+    
     if missing:
-        print(f"❌ Missing config: {', '.join(missing)}")
+        print(f"❌ Missing required environment variables: {', '.join(missing)}")
+        print("❌ Configuration validation failed")
+        return False
+    
+    if not os.path.exists(CA_CERT_PATH):
+        print(f"❌ CA certificate not found at: {CA_CERT_PATH}")
         return False
 
-    print("✅ Configuration OK")
-    print(f"Broker: {BROKER}:{PORT}")
-    print(f"Topic: {TOPIC}")
+    print("✅ Configuration validation passed")
+    print(f"✅ Broker: {BROKER}:{PORT}")
+    print(f"✅ Topic: {TOPIC}")
+    print(f"✅ CA Cert: {CA_CERT_PATH}")
     return True
 
 # =========================

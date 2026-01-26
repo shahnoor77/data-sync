@@ -76,31 +76,158 @@ Status: ✅ Complete - 1,000,000 sent, 1,000,000 acked
 - **Error Handling**: Comprehensive retry logic with DLQ fallback
 - **Zero-Crash Logic**: Graceful degradation under all failure conditions
 
+## 🌩️ EMQX Cloud Integration
+
+### Cloud Configuration
+
+The system is configured to connect to EMQX Cloud Serverless instance with TLS encryption:
+
+```bash
+# EMQX Cloud Serverless Configuration
+MQTT_BROKER_HOST=
+MQTT_BROKER_PORT=
+MQTT_USERNAME=
+MQTT_PASSWORD=
+CA_CERT_PATH=/app/emqx-ca-cert.pem
+```
+
+### TLS Certificate Setup
+
+1. **Download CA Certificate**: 
+   - Log into your EMQX Cloud console
+   - Navigate to your deployment details
+   - Download the CA certificate file
+   - Save it as `emqx-ca-cert.pem` in the project root
+
+2. **Verify Certificate**:
+   ```bash
+   # Check certificate validity
+   openssl x509 -in emqx-ca-cert.pem -text -noout
+   ```
+
+### Cloud Connectivity Testing
+
+Test your EMQX Cloud connection before running stress tests:
+
+```bash
+# Build cloud-enabled image
+docker build -f Dockerfile.live -t stress-tester-cloud .
+
+# Test connectivity
+docker run --rm stress-tester-cloud python test_emqx_cloud_connection.py
+
+# Expected output:
+# 🔗 EMQX Cloud Connectivity Test
+# ✅ Connected successfully!
+# 📡 Subscribed to sensors/test/connectivity
+# 🎉 EMQX Cloud connectivity test PASSED!
+```
+
+### Cloud Stress Testing
+
+Run high-throughput tests against EMQX Cloud:
+
+```bash
+# Full 1M message test
+docker run --rm stress-tester-cloud
+
+# Custom test parameters
+docker run --rm \
+  -e TOTAL_MESSAGES=100000 \
+  -e CONCURRENCY=2 \
+  stress-tester-cloud
+
+# Monitor with verbose logging
+docker run --rm \
+  -e TOTAL_MESSAGES=50000 \
+  -e CONCURRENCY=1 \
+  stress-tester-cloud
+```
+
+### Cloud Performance Characteristics
+
+**Expected Performance with EMQX Cloud:**
+- **Throughput**: 1,000-3,000 msg/s (varies by region/plan)
+- **Latency**: 50-200ms (depends on geographic distance)
+- **Reliability**: 99.9% uptime with automatic failover
+- **Security**: TLS 1.2+ encryption with certificate validation
+
+### Troubleshooting Cloud Connection
+
+**Common Issues:**
+
+1. **Certificate Errors**:
+   ```
+   Error: certificate verify failed
+   Solution: Ensure emqx-ca-cert.pem contains the correct CA certificate
+   ```
+
+2. **Authentication Failures**:
+   ```
+   Error: Connection refused (5)
+   Solution: Verify username/password in EMQX Cloud console
+   ```
+
+3. **Network Timeouts**:
+   ```
+   Error: Connection timeout
+   Solution: Check firewall rules for port 8883 outbound
+   ```
+
+4. **TLS Handshake Failures**:
+   ```bash
+   # Test TLS connection manually
+   openssl s_client -connect ef926611.ala.asia-southeast1.emqxsl.com:8883 -CAfile emqx-ca-cert.pem
+   ```
+
+### Cloud Monitoring
+
+Monitor your EMQX Cloud deployment:
+
+1. **EMQX Cloud Dashboard**: Real-time metrics and connection status
+2. **Message Flow**: Track publish/subscribe rates
+3. **Connection Health**: Monitor client connections and disconnections
+4. **Resource Usage**: CPU, memory, and bandwidth utilization
+
 ## 🚀 Quick Start
 
 ### Prerequisites
 - Docker & Docker Compose
 - Python 3.9+
 - MySQL 8.0+
-- EMQX MQTT Broker
+- EMQX Cloud Serverless account
+- CA certificate from EMQX Cloud dashboard
 
 ### Launch the System
 ```bash
-# Start infrastructure
-docker-compose up -d
+# 1. Download CA certificate from EMQX Cloud and save as emqx-ca-cert.pem
 
-# Run stress test
-docker run --rm --network=data-sync_sensor_network stress-tester
+# 2. Start local databases only (MQTT handled by EMQX Cloud)
+docker-compose -f docker-compose.local.yaml up -d
 
-# Monitor subscriber logs
-docker-compose logs -f subscriber
+# 3. Build cloud-enabled stress tester
+docker build -f Dockerfile.live -t stress-tester-cloud .
+
+# 4. Test cloud connectivity
+docker run --rm stress-tester-cloud python test_emqx_cloud_connection.py
+
+# 5. Run stress test against EMQX Cloud
+docker run --rm stress-tester-cloud
+
+# 6. Optional: Run subscriber locally (connects to EMQX Cloud)
+docker-compose up -d mqtt-subscriber
+
+# 7. Monitor logs
+docker-compose logs -f mqtt-subscriber
 ```
 
 ### Configuration
 Key configuration files:
 - `config/config.yaml` - Main application settings
-- `.env` - Environment variables
-- `docker-compose.yaml` - Infrastructure setup
+- `.env` - Environment variables (updated for EMQX Cloud)
+- `docker-compose.yaml` - Full infrastructure with EMQX Cloud integration
+- `docker-compose.local.yaml` - Local databases only
+- `emqx-ca-cert.pem` - EMQX Cloud CA certificate (download from dashboard)
 
 ## 📊 Performance Tuning
 
@@ -226,8 +353,8 @@ DB_NAME=sensor_data
 
 # MQTT
 MQTT_BROKER=emqx-cluster:1883
-MQTT_USERNAME=sensor_client
-MQTT_PASSWORD=mqtt_password
+MQTT_USERNAME=
+MQTT_PASSWORD=
 
 # Application
 LOG_LEVEL=INFO

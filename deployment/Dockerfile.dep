@@ -1,0 +1,42 @@
+FROM emqx/emqx:5.4.1
+
+# Set working directory
+WORKDIR /opt/emqx
+
+# Create directories with proper ownership (run as root first)
+USER root
+RUN mkdir -p /opt/emqx/etc/certs \
+    && mkdir -p /opt/emqx/data \
+    && mkdir -p /opt/emqx/log \
+    && chown -R 1000:1000 /opt/emqx/etc/certs \
+    && chown -R 1000:1000 /opt/emqx/data \
+    && chown -R 1000:1000 /opt/emqx/log
+
+# Copy configuration files (no secrets)
+COPY --chown=1000:1000 emqx.conf /opt/emqx/etc/emqx.conf
+COPY --chown=1000:1000 acl.conf /opt/emqx/etc/acl.conf
+
+# Copy entrypoint script
+COPY --chown=1000:1000 entrypoint.sh /opt/emqx/entrypoint.sh
+RUN chmod +x /opt/emqx/entrypoint.sh
+
+# Switch to emqx user (UID 1000)
+USER 1000
+
+# Environment variables for node configuration (minimal defaults)
+ENV EMQX_NODE__NAME=emqx@127.0.0.1
+ENV EMQX_CLUSTER__DISCOVERY_STRATEGY=manual
+ENV EMQX_NODE__COOKIE=emqxsecretcookie
+
+# Expose ports
+EXPOSE 1883 8883 8083 8084 18083 4370
+
+# Create volumes for persistence
+VOLUME ["/opt/emqx/data", "/opt/emqx/log"]
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD emqx_ctl status || exit 1
+
+# Use custom entrypoint that handles TLS certificates from environment
+ENTRYPOINT ["/opt/emqx/entrypoint.sh"]
